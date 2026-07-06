@@ -805,23 +805,160 @@ export function createAppServices(store) {
       .map((check) => ({ ...check, ago: relativeTime(check.occurredAt) }));
   }
 
+  function artifactType(artifact) {
+    if (artifact.kind !== "report") return titleCase(artifact.kind);
+    const title = artifact.title.toLowerCase();
+    if (title.includes("weekly") || title.includes("executive") || title.includes("presentation")) return "Presentation";
+    if (title.includes("checklist") || title.includes("spreadsheet")) return "Spreadsheet";
+    if (title.includes("access review")) return "Workbook";
+    if (title.includes("report") || title.includes("assessment") || title.includes("analysis")) return "Report";
+    return "Document";
+  }
+
+  function artifactSortRank(artifact) {
+    if (artifact.kind === "report") return 0;
+    if (artifact.kind === "tool_execution_result") return 1;
+    if (artifact.kind === "audit_export") return 2;
+    if (artifact.kind === "agent_proposal") return 3;
+    return 4;
+  }
+
+  function artifactWorkflowSortRank(artifact) {
+    const run = store.workflowRuns.find((entry) => entry.id === artifact.workflowRunId);
+    const order = ["contract_review", "financial_analysis", "security_triage", "market_research", "access_review", "executive_reporting", "procurement_intake"];
+    const index = order.indexOf(run?.type);
+    return index === -1 ? order.length : index;
+  }
+
+  function artifactClassification(artifact, run) {
+    const title = artifact.title.toLowerCase();
+    const risk = run?.request?.vendorRisk ?? "medium";
+    if (title.includes("security") || risk === "sanctioned") {
+      return { value: "highly_restricted", label: "Highly Restricted" };
+    }
+    if (risk === "high" || title.includes("contract") || artifact.kind === "audit_export") {
+      return { value: "confidential", label: "Confidential" };
+    }
+    if (artifact.kind === "tool_execution_result" || artifact.kind === "agent_proposal") {
+      return { value: "confidential", label: "Confidential" };
+    }
+    return { value: "internal", label: "Internal" };
+  }
+
+  function artifactAccess(classification, run, artifact) {
+    if (classification.value === "highly_restricted") return { value: "restricted", label: "Restricted" };
+    if (run?.request?.department === "Executive") return { value: "exec_only", label: "Exec Only" };
+    if (classification.value === "confidential") return { value: "restricted", label: "Restricted" };
+    if (artifact.title.toLowerCase().includes("marketing")) return { value: "shared", label: "Shared" };
+    return { value: "team_access", label: "Team Access" };
+  }
+
+  function artifactPolicyStatus({ policyChecks, pendingApproval, classification }) {
+    if (policyChecks.some((check) => check.result === "blocked")) return { value: "flagged", label: "Flagged" };
+    if (classification.value === "highly_restricted" && !policyChecks.length) return { value: "flagged", label: "Flagged" };
+    if (pendingApproval) return { value: "pending_review", label: "Pending Review" };
+    if (policyChecks.some((check) => check.result === "alert")) return { value: "needs_approval", label: "Needs Approval" };
+    return { value: "compliant", label: "Compliant" };
+  }
+
+  function artifactDataSource(run, proposal, artifact) {
+    if (artifact.ownerType === "tool") {
+      return store.toolConnectors.find((tool) => tool.id === artifact.ownerId)?.name ?? "Tool";
+    }
+    if (run?.type === "contract_review") return "Contract DB + DocuSign";
+    if (run?.type === "financial_analysis") return "Finance Warehouse";
+    if (run?.type === "security_triage") return "Security Stack";
+    if (run?.type === "access_review") return "IAM Directory";
+    if (run?.type === "executive_reporting") return "Reports Warehouse";
+    if (proposal?.connectorId) {
+      return store.toolConnectors.find((tool) => tool.id === proposal.connectorId)?.name ?? "Tool";
+    }
+    return "Agent Workspace";
+  }
+
+  function artifactAudience(access, run) {
+    if (access.value === "restricted" && run?.type === "contract_review") return "Legal Counsel, Contract Owner";
+    if (access.value === "restricted") return "Owner, Compliance, Security";
+    if (access.value === "exec_only") return "Executive team";
+    if (access.value === "shared") return "Marketing team, approved external reviewers";
+    return `${run?.request?.department ?? "Workspace"} team`;
+  }
+
+  function auditActorName(event) {
+    if (event.actorType === ACTOR_TYPES.USER) return store.users.find((user) => user.id === event.actorId)?.name ?? event.actorId;
+    if (event.actorType === ACTOR_TYPES.AGENT) return store.agents.find((agent) => agent.id === event.actorId)?.name ?? event.actorId;
+    return event.actorId;
+  }
+
   function listArtifacts() {
     return [...store.evidenceArtifacts]
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .sort((a, b) => artifactSortRank(a) - artifactSortRank(b) || artifactWorkflowSortRank(a) - artifactWorkflowSortRank(b) || b.updatedAt.localeCompare(a.updatedAt))
       .map((artifact) => {
+        const run = store.workflowRuns.find((entry) => entry.id === artifact.workflowRunId);
+        const requester = store.users.find((user) => user.id === run?.requesterUserId);
+        const proposal = store.toolActionProposals.find((entry) => entry.workflowRunId === artifact.workflowRunId);
+        const pendingApproval = store.approvalRequests.find((approval) => approval.workflowRunId === artifact.workflowRunId && approval.status === APPROVAL_STATUS.PENDING);
+        const policyChecks = store.policyChecks.filter((check) => check.workflowRunId === artifact.workflowRunId);
+        const auditEvents = store.auditEvents
+          .filter((event) => event.targetId === artifact.id || event.evidenceArtifactIds?.includes(artifact.id) || event.workflowRunId === artifact.workflowRunId)
+          .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
+          .slice(0, 8)
+          .map((event) => ({
+            id: event.id,
+            action: event.action,
+            summary: event.summary,
+            actor: auditActorName(event),
+            occurredAt: event.occurredAt,
+            ago: relativeTime(event.occurredAt)
+          }));
         const owner =
           artifact.ownerType === "agent"
             ? store.agents.find((agent) => agent.id === artifact.ownerId)?.name
             : artifact.ownerType === "tool"
               ? store.toolConnectors.find((tool) => tool.id === artifact.ownerId)?.name
               : "System";
+        const classification = artifactClassification(artifact, run);
+        const access = artifactAccess(classification, run, artifact);
+        const policyStatus = artifactPolicyStatus({ policyChecks, pendingApproval, classification });
+        const waitingOn = pendingApproval?.requiredApprovers?.[0]?.userId
+          ? store.users.find((user) => user.id === pendingApproval.requiredApprovers[0].userId)?.name
+          : null;
+        const version = `v${(Number.parseInt(artifact.contentHash.slice(0, 2), 16) % 7) + 1}`;
+        const type = artifactType(artifact);
         return {
           id: artifact.id,
           name: artifact.title,
-          type: titleCase(artifact.kind),
+          type,
+          typeKey: type.toLowerCase().replaceAll(" ", "_"),
           owner: owner ?? "System",
+          ownerType: artifact.ownerType,
+          ownerId: artifact.ownerId,
           workflowRunId: artifact.workflowRunId,
+          linkedWorkItemTitle: run?.title ?? "Unlinked Artifact",
+          linkedWorkItemId: run?.id ?? null,
+          department: run?.request?.department ?? requester?.department ?? "Unknown",
+          classification: classification.value,
+          classificationLabel: classification.label,
+          access: access.value,
+          accessLabel: access.label,
+          policyStatus: policyStatus.value,
+          policyStatusLabel: policyStatus.label,
+          policyClassification: classification.value === "confidential" && run?.type === "contract_review" ? "Customer-sensitive pricing terms" : classification.label,
+          version,
+          dataSource: artifactDataSource(run, proposal, artifact),
+          createdBy: owner ?? requester?.name ?? "System",
+          approvedAudience: artifactAudience(access, run),
+          sharingPolicy: access.value === "restricted" ? "External sharing requires approval" : access.value === "shared" ? "External sharing allowed for approved audience" : "Internal sharing allowed",
+          retentionPolicy: run?.type === "contract_review" ? "7 years" : "365 days",
+          needsReview: policyStatus.value !== "compliant",
+          slaStatus: pendingApproval && new Date(pendingApproval.dueAt).getTime() < Date.now() ? "breached" : "healthy",
+          waitingOn,
+          summary: artifact.kind === "agent_proposal" ? proposal?.summary : `Generated artifact for ${run?.title ?? "workflow"}.`,
+          policyChecks: policyChecks.map((check) => ({ ...check, ago: relativeTime(check.occurredAt) })),
+          auditEvents,
           contentHash: artifact.contentHash,
+          createdAt: artifact.createdAt,
+          created: relativeTime(artifact.createdAt),
           updatedAt: artifact.updatedAt,
           updated: relativeTime(artifact.updatedAt)
         };

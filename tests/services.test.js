@@ -192,6 +192,25 @@ test("dashboard read model is computed from real domain records", () => {
   assert.equal(dashboard.artifacts.some((artifact) => artifact.workflowRunId === afterProposal.id), true);
 });
 
+test("artifact read model includes linked workflow and governance metadata", () => {
+  const { services } = createHarness();
+  const artifacts = services.listArtifacts();
+  const contract = artifacts.find((artifact) => artifact.name === "Contract Summary Draft");
+
+  assert.ok(contract);
+  assert.equal(contract.linkedWorkItemTitle, "Vendor Contract Review");
+  assert.equal(contract.department, "Legal");
+  assert.equal(contract.classification, "confidential");
+  assert.equal(contract.access, "restricted");
+  assert.equal(contract.policyStatus, "pending_review");
+  assert.equal(contract.dataSource, "Contract DB + DocuSign");
+  assert.equal(contract.approvedAudience, "Legal Counsel, Contract Owner");
+  assert.match(contract.version, /^v[1-7]$/);
+  assert.equal(Array.isArray(contract.policyChecks), true);
+  assert.equal(Array.isArray(contract.auditEvents), true);
+  assert.equal(contract.auditEvents.some((event) => event.action === "artifact.created"), true);
+});
+
 test("agent run lifecycle updates dashboard and timeline", () => {
   const { services, requester } = createHarness();
   const run = createRun(services, requester, { vendor: "AgentRunCo", amount: 900, vendorRisk: "low" });

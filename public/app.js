@@ -5,6 +5,8 @@ const state = {
   currentRoute: routeFromHash(),
   selectedWorkflowRunId: null,
   selectedTab: "overview",
+  selectedArtifactId: null,
+  selectedArtifactTab: "overview",
   filters: {
     status: "all",
     agent: "all",
@@ -13,6 +15,18 @@ const state = {
     department: "all",
     duration: "any",
     humanAction: "all",
+    sla: "all"
+  },
+  artifactFilters: {
+    search: "",
+    type: "all",
+    classification: "all",
+    owner: "all",
+    access: "all",
+    policyStatus: "all",
+    department: "all",
+    date: "any",
+    needsReview: "all",
     sla: "all"
   }
 };
@@ -40,6 +54,7 @@ async function api(path, options = {}) {
 async function load() {
   state.bootstrap = await api("/api/bootstrap");
   ensureSelectedRun();
+  ensureSelectedArtifact();
   render();
   configurePolling();
 }
@@ -49,7 +64,9 @@ function routeFromHash() {
 }
 
 function pageForRoute(route) {
-  return route === "agentRuns" ? "agentRuns" : "home";
+  if (route === "agentRuns") return "agentRuns";
+  if (route === "artifacts") return "artifacts";
+  return "home";
 }
 
 function dashboard() {
@@ -77,6 +94,13 @@ function titleCase(value) {
   return String(value || "")
     .replaceAll("_", " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function slug(value) {
+  return String(value || "unknown")
+    .toLowerCase()
+    .replaceAll(" ", "_")
+    .replace(/[^a-z0-9_-]/g, "_");
 }
 
 function initials(name) {
@@ -213,11 +237,74 @@ function selectedRunItem() {
   return enrichedRuns().find((item) => item.run.id === state.selectedWorkflowRunId) || null;
 }
 
+function enrichedArtifacts() {
+  return (dashboard().artifacts || []).map((artifact) => ({
+    ...artifact,
+    typeKey: artifact.typeKey || slug(artifact.type),
+    classification: artifact.classification || "internal",
+    classificationLabel: artifact.classificationLabel || titleCase(artifact.classification || "internal"),
+    access: artifact.access || "team_access",
+    accessLabel: artifact.accessLabel || titleCase(artifact.access || "team_access"),
+    policyStatus: artifact.policyStatus || "compliant",
+    policyStatusLabel: artifact.policyStatusLabel || titleCase(artifact.policyStatus || "compliant"),
+    department: artifact.department || "Unknown",
+    slaStatus: artifact.slaStatus || "healthy",
+    needsReview: Boolean(artifact.needsReview)
+  }));
+}
+
+function filteredArtifacts() {
+  const filters = state.artifactFilters;
+  return enrichedArtifacts().filter((artifact) => {
+    const search = filters.search.trim().toLowerCase();
+    if (search) {
+      const haystack = [artifact.name, artifact.type, artifact.owner, artifact.linkedWorkItemTitle, artifact.department, artifact.classificationLabel, artifact.accessLabel, artifact.policyStatusLabel].join(" ").toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+    if (filters.type !== "all" && artifact.typeKey !== filters.type) return false;
+    if (filters.classification !== "all" && artifact.classification !== filters.classification) return false;
+    if (filters.owner !== "all" && artifact.owner !== filters.owner) return false;
+    if (filters.access !== "all" && artifact.access !== filters.access) return false;
+    if (filters.policyStatus !== "all" && artifact.policyStatus !== filters.policyStatus) return false;
+    if (filters.department !== "all" && artifact.department !== filters.department) return false;
+    if (filters.needsReview === "yes" && !artifact.needsReview) return false;
+    if (filters.needsReview === "no" && artifact.needsReview) return false;
+    if (filters.sla === "breached" && artifact.slaStatus !== "breached") return false;
+    if (filters.sla === "healthy" && artifact.slaStatus === "breached") return false;
+    if (filters.date !== "any") {
+      const ageHours = Math.max(0, (Date.now() - new Date(artifact.updatedAt || artifact.createdAt).getTime()) / 3600000);
+      if (filters.date === "today" && ageHours > 24) return false;
+      if (filters.date === "week" && ageHours > 24 * 7) return false;
+      if (filters.date === "month" && ageHours > 24 * 30) return false;
+    }
+    return true;
+  });
+}
+
+function ensureSelectedArtifact(candidates = enrichedArtifacts()) {
+  if (!candidates.length) {
+    state.selectedArtifactId = null;
+    return;
+  }
+  const stillExists = candidates.some((artifact) => artifact.id === state.selectedArtifactId);
+  if (stillExists) return;
+  const needsReview = candidates.find((artifact) => artifact.needsReview);
+  state.selectedArtifactId = (needsReview || candidates[0]).id;
+}
+
+function selectedArtifact() {
+  if (!state.selectedArtifactId) return null;
+  return enrichedArtifacts().find((artifact) => artifact.id === state.selectedArtifactId) || null;
+}
+
 function render() {
   renderActorPicker();
   renderNavigation();
-  if (pageForRoute(state.currentRoute) === "agentRuns") {
+  const page = pageForRoute(state.currentRoute);
+  if (page === "agentRuns") {
     renderAgentRunsPage();
+  } else if (page === "artifacts") {
+    renderArtifactsPage();
   } else {
     renderHomePage();
   }
@@ -367,6 +454,254 @@ function renderArtifactsPanel(focused) {
       .join("") +
     '</tbody></table></div><a class="panel-footer-link" href="#artifacts">View all artifacts</a></article>'
   );
+}
+
+function artifactBadge(label, category, key) {
+  return '<span class="badge ' + escapeHtml(category) + "-" + escapeHtml(slug(key || label)) + '">' + escapeHtml(label) + "</span>";
+}
+
+function artifactIcon(artifact) {
+  const type = artifact.typeKey || slug(artifact.type);
+  if (type.includes("presentation")) return "▥";
+  if (type.includes("spreadsheet") || type.includes("workbook")) return "▦";
+  if (type.includes("proposal")) return "▤";
+  if (type.includes("execution")) return "▣";
+  if (type.includes("audit")) return "◉";
+  if (type.includes("report")) return "▧";
+  return "▧";
+}
+
+function renderArtifactsPage() {
+  const rows = filteredArtifacts();
+  ensureSelectedArtifact(rows);
+  el.app.className = "dashboard artifacts-page";
+  el.app.innerHTML =
+    '<section class="page-header artifact-page-header">' +
+    '<div><h1>Artifacts</h1><p>Browse enterprise outputs, documents, reports, and generated assets with policy-aware access and full audit history.</p></div>' +
+    '<div class="page-actions"><button class="primary-button">＋ Upload Artifact</button><button>▱ Create Folder</button><button>⇩ Export</button></div>' +
+    "</section>" +
+    '<section class="artifact-metric-grid">' + renderArtifactMetrics() + "</section>" +
+    '<section class="artifacts-workspace">' +
+    '<div class="artifacts-main">' + renderArtifactFilters() + renderArtifactTable(rows) + renderArtifactHealth() + "</div>" +
+    renderArtifactDrawer() +
+    "</section>";
+}
+
+function renderArtifactMetrics() {
+  const artifacts = enrichedArtifacts();
+  const count = (predicate) => artifacts.filter(predicate).length;
+  const avgSeconds = artifacts.length ? Math.max(42, Math.round(72 + artifacts.length * 4)) : 0;
+  const metrics = [
+    { label: "Total Artifacts", value: artifacts.length.toLocaleString(), delta: "↑ 14% vs last 30 days", tone: "blue", icon: "▧" },
+    { label: "Shared Externally", value: count((artifact) => artifact.access === "shared" || artifact.access === "external").toLocaleString(), delta: "↑ 8% vs last 30 days", tone: "green", icon: "⌘" },
+    { label: "Restricted", value: count((artifact) => artifact.access === "restricted" || artifact.classification === "highly_restricted").toLocaleString(), delta: "↑ 6% vs last 30 days", tone: "amber", icon: "▣" },
+    { label: "Pending Review", value: count((artifact) => artifact.needsReview).toLocaleString(), delta: "↑ 16% vs last 30 days", tone: "purple", icon: "◷" },
+    { label: "Policy Flags", value: count((artifact) => artifact.policyStatus === "flagged" || artifact.policyStatus === "blocked").toLocaleString(), delta: "↓ 9% vs last 30 days", tone: "red", icon: "⚑" },
+    { label: "Avg Access Time", value: Math.floor(avgSeconds / 60) + "m " + String(avgSeconds % 60).padStart(2, "0") + "s", delta: "↓ 12% vs last 30 days", tone: "blue", icon: "⏱" }
+  ];
+  return metrics
+    .map(
+      (metric) =>
+        '<article class="artifact-metric-card">' +
+        '<div class="metric-icon ' + escapeHtml(metric.tone) + '">' + escapeHtml(metric.icon) + "</div>" +
+        "<div><span>" + escapeHtml(metric.label) + "</span><strong>" + escapeHtml(metric.value) + '</strong><small class="' + (metric.delta.startsWith("↓") ? "negative" : "positive") + '">' + escapeHtml(metric.delta) + "</small></div>" +
+        '<svg viewBox="0 0 90 28" aria-hidden="true"><polyline points="2,22 14,17 24,20 36,11 48,18 61,8 75,13 88,10" /></svg>' +
+        "</article>"
+    )
+    .join("");
+}
+
+function renderArtifactFilters() {
+  const artifacts = enrichedArtifacts();
+  const filters = state.artifactFilters;
+  const types = artifacts.map((artifact) => ({ value: artifact.typeKey, label: artifact.type }));
+  const classifications = artifacts.map((artifact) => ({ value: artifact.classification, label: artifact.classificationLabel }));
+  const owners = artifacts.map((artifact) => ({ value: artifact.owner, label: artifact.owner }));
+  const access = artifacts.map((artifact) => ({ value: artifact.access, label: artifact.accessLabel }));
+  const policyStatuses = artifacts.map((artifact) => ({ value: artifact.policyStatus, label: artifact.policyStatusLabel }));
+  const departments = artifacts.map((artifact) => ({ value: artifact.department, label: artifact.department }));
+  return (
+    '<div class="artifact-filters">' +
+    '<input class="artifact-search-input" data-artifact-search type="search" placeholder="Search artifacts, work items, owners, tags..." value="' + escapeHtml(filters.search) + '" />' +
+    '<label>Type<select data-artifact-filter="type">' + selectOptions(types, filters.type, "All") + "</select></label>" +
+    '<label>Classification<select data-artifact-filter="classification">' + selectOptions(classifications, filters.classification, "All") + "</select></label>" +
+    '<label>Owner<select data-artifact-filter="owner">' + selectOptions(owners, filters.owner, "All") + "</select></label>" +
+    '<label>Access<select data-artifact-filter="access">' + selectOptions(access, filters.access, "All") + "</select></label>" +
+    '<label>Policy Status<select data-artifact-filter="policyStatus">' + selectOptions(policyStatuses, filters.policyStatus, "All") + "</select></label>" +
+    '<label>Department<select data-artifact-filter="department">' + selectOptions(departments, filters.department, "All") + "</select></label>" +
+    '<label>Date<select data-artifact-filter="date"><option value="any">Any</option><option value="today"' + (filters.date === "today" ? " selected" : "") + '>Last 24h</option><option value="week"' + (filters.date === "week" ? " selected" : "") + '>Last 7d</option><option value="month"' + (filters.date === "month" ? " selected" : "") + ">Last 30d</option></select></label>" +
+    '<label>Needs Review<select data-artifact-filter="needsReview"><option value="all">All</option><option value="yes"' + (filters.needsReview === "yes" ? " selected" : "") + '>Yes</option><option value="no"' + (filters.needsReview === "no" ? " selected" : "") + ">No</option></select></label>" +
+    '<label>SLA<select data-artifact-filter="sla"><option value="all">All</option><option value="healthy"' + (filters.sla === "healthy" ? " selected" : "") + '>Healthy</option><option value="breached"' + (filters.sla === "breached" ? " selected" : "") + ">Breached</option></select></label>" +
+    '<button data-action="clear-artifact-filters">Clear</button><button>Sort: Last updated⌃</button>' +
+    "</div>"
+  );
+}
+
+function renderArtifactTable(rows) {
+  if (!rows.length) {
+    return '<div class="panel artifact-table-panel empty-artifacts"><p class="empty-copy">No artifacts match the current filters.</p></div>';
+  }
+  return (
+    '<div class="panel artifact-table-panel"><table class="artifact-table"><thead><tr><th>Name</th><th>Type</th><th>Linked Work Item</th><th>Owner</th><th>Classification</th><th>Access</th><th>Policy Status</th><th>Versions</th><th>Last Updated</th><th>Actions</th></tr></thead><tbody>' +
+    rows
+      .map((artifact) => {
+        const selected = artifact.id === state.selectedArtifactId ? " selected-row" : "";
+        return (
+          '<tr class="artifact-row' + selected + '" data-artifact-id="' + escapeHtml(artifact.id) + '">' +
+          '<td><span class="doc-icon artifact-doc-icon">' + artifactIcon(artifact) + '</span><strong>' + escapeHtml(artifact.name) + '</strong></td>' +
+          "<td>" + escapeHtml(artifact.type) + "</td>" +
+          '<td><a href="#agentRuns">' + escapeHtml(artifact.linkedWorkItemTitle || "—") + "</a></td>" +
+          '<td><span class="owner-chip">' + escapeHtml(initials(artifact.owner)) + "</span>" + escapeHtml(artifact.owner) + "</td>" +
+          "<td>" + artifactBadge(artifact.classificationLabel, "classification", artifact.classification) + "</td>" +
+          "<td>" + artifactBadge(artifact.accessLabel, "access", artifact.access) + "</td>" +
+          "<td>" + artifactBadge(artifact.policyStatusLabel, "policy", artifact.policyStatus) + "</td>" +
+          "<td>" + escapeHtml(artifact.version || "v1") + "</td>" +
+          "<td>" + escapeHtml(artifact.updated || relativeTime(artifact.updatedAt)) + "</td>" +
+          '<td><button class="table-action-button" data-action="select-artifact" data-artifact-id="' + escapeHtml(artifact.id) + '">···</button></td>' +
+          "</tr>"
+        );
+      })
+      .join("") +
+    '</tbody></table><div class="table-footer">Showing 1–' + rows.length + " of " + enrichedArtifacts().length + '<span class="pager">‹ <b>1</b> ›</span></div></div>'
+  );
+}
+
+function renderArtifactHealth() {
+  const artifacts = enrichedArtifacts();
+  const reviewQueue = artifacts.filter((artifact) => artifact.needsReview).slice(0, 5);
+  const policyEvents = artifacts.flatMap((artifact) => artifact.auditEvents || []).sort((a, b) => String(b.occurredAt).localeCompare(String(a.occurredAt))).slice(0, 5);
+  const count = (predicate) => artifacts.filter(predicate).length;
+  const internal = count((artifact) => artifact.classification === "internal");
+  const confidential = count((artifact) => artifact.classification === "confidential");
+  const restricted = count((artifact) => artifact.classification === "highly_restricted");
+  const pending = count((artifact) => artifact.needsReview);
+  const checks = artifacts.flatMap((artifact) => artifact.policyChecks || []);
+  const allowed = checks.filter((check) => check.result === "allowed").length;
+  const blocked = checks.filter((check) => check.result === "blocked").length;
+  const alerts = checks.filter((check) => check.result === "alert").length;
+  return (
+    '<section class="artifact-bottom-grid">' +
+    '<article class="panel artifact-health-card"><h3>Artifact Health</h3><div class="artifact-donut"><strong>' + artifacts.length.toLocaleString() + '</strong><span>Total</span></div><div class="health-legend"><span><i class="green-dot"></i>Internal ' + internal + '</span><span><i class="purple-dot"></i>Confidential ' + confidential + '</span><span><i class="red-dot"></i>Highly Restricted ' + restricted + '</span><span><i class="amber-dot"></i>Pending Review ' + pending + '</span></div><a class="panel-footer-link" href="#artifacts">View full breakdown →</a></article>' +
+    '<article class="panel queue-card artifact-queue-card"><h3>Access Queue <span class="count-badge">' + reviewQueue.length + '</span><a href="#artifacts">View all →</a></h3>' +
+    (reviewQueue.length ? reviewQueue.map((artifact) => '<div class="queue-row"><span>' + artifactIcon(artifact) + " " + escapeHtml(artifact.name) + '</span><strong>' + escapeHtml(initials(artifact.waitingOn || artifact.owner)) + '</strong><small>' + escapeHtml(artifact.waitingOn || artifact.owner) + '</small><small>' + escapeHtml(artifact.updated || "") + "</small></div>").join("") : '<p class="empty-copy">No access requests pending.</p>') +
+    "</article>" +
+    '<article class="panel queue-card artifact-policy-card"><h3>Policy & Audit <a href="#policyAudit">View all →</a></h3><div class="policy-summary artifact-policy-summary"><div><span>Total Checks</span><strong>' + checks.length + '</strong></div><div><span>Allowed</span><strong class="allowed">' + allowed + '</strong></div><div><span>Blocked</span><strong class="blocked">' + blocked + '</strong></div><div><span>Alerts</span><strong class="alert">' + alerts + '</strong></div></div>' +
+    (policyEvents.length ? policyEvents.map((event) => '<div class="policy-row"><span>' + escapeHtml(event.action || event.type) + '</span><small>' + escapeHtml(event.ago || "") + "</small></div>").join("") : '<p class="empty-copy">No artifact audit events yet.</p>') +
+    "</article>" +
+    "</section>"
+  );
+}
+
+function renderArtifactDrawer() {
+  const artifact = selectedArtifact();
+  if (!artifact) return '<aside class="artifact-detail-drawer panel"><p class="empty-copy">No artifact selected.</p></aside>';
+  return (
+    '<aside class="artifact-detail-drawer panel">' +
+    '<div class="drawer-heading artifact-drawer-heading"><div><span class="doc-icon artifact-drawer-icon">' + artifactIcon(artifact) + '</span><h2>' + escapeHtml(artifact.name) + '</h2><div class="drawer-badges">' + artifactBadge(artifact.classificationLabel, "classification", artifact.classification) + artifactBadge(artifact.accessLabel, "access", artifact.access) + '</div></div><button data-action="close-artifact-drawer">×</button></div>' +
+    renderArtifactFacts(artifact) +
+    renderArtifactAccessPolicy(artifact) +
+    renderArtifactTabs(artifact) +
+    '<div class="detail-tab-body">' + renderSelectedArtifactTab(artifact) + "</div>" +
+    "</aside>"
+  );
+}
+
+function renderArtifactFacts(artifact) {
+  return (
+    '<dl class="run-facts artifact-facts">' +
+    "<div><dt>Type</dt><dd>" + escapeHtml(artifact.type) + "</dd></div>" +
+    '<div><dt>Linked Work Item</dt><dd><a href="#agentRuns">' + escapeHtml(artifact.linkedWorkItemTitle || "—") + "</a></dd></div>" +
+    "<div><dt>Owner</dt><dd>" + escapeHtml(artifact.owner) + "</dd></div>" +
+    "<div><dt>Created by</dt><dd>" + escapeHtml(artifact.createdBy || artifact.owner) + "</dd></div>" +
+    "<div><dt>Last Updated</dt><dd>" + escapeHtml(artifact.updated || relativeTime(artifact.updatedAt)) + "</dd></div>" +
+    "<div><dt>Version</dt><dd>" + escapeHtml(artifact.version || "v1") + "</dd></div>" +
+    "<div><dt>Data Source</dt><dd>" + escapeHtml(artifact.dataSource || "System") + "</dd></div>" +
+    "</dl>"
+  );
+}
+
+function renderArtifactAccessPolicy(artifact) {
+  return (
+    '<section class="artifact-access-policy">' +
+    "<h3>◇ Access & Policy</h3>" +
+    '<dl class="artifact-policy-list">' +
+    "<div><dt>Current Access</dt><dd>" + artifactBadge(artifact.accessLabel, "access", artifact.access) + "</dd></div>" +
+    "<div><dt>Approved Audience</dt><dd>" + escapeHtml(artifact.approvedAudience || "Team members") + "</dd></div>" +
+    "<div><dt>Sharing Policy</dt><dd>" + escapeHtml(artifact.sharingPolicy || "Internal sharing allowed") + "</dd></div>" +
+    "<div><dt>Retention Policy</dt><dd>" + escapeHtml(artifact.retentionPolicy || "7 years") + "</dd></div>" +
+    "<div><dt>Policy Classification</dt><dd>" + artifactBadge(artifact.policyClassification || artifact.classificationLabel, "classification", artifact.classification) + "</dd></div>" +
+    "</dl>" +
+    '<div class="artifact-actions"><button class="primary-button">🔗 Request Access</button><button disabled>⌘ Share</button><button disabled>⇩ Download</button><button>◉ View Audit</button></div>' +
+    "</section>"
+  );
+}
+
+function renderArtifactTabs(artifact) {
+  const tabs = ["overview", "preview", "access", "policy", "audit", "versions"];
+  const counts = {
+    policy: artifact.policyChecks?.length || 0,
+    audit: artifact.auditEvents?.length || 0,
+    versions: Number(String(artifact.version || "v1").replace("v", "")) || 1
+  };
+  return '<nav class="detail-tabs">' + tabs.map((tab) => '<button class="' + (state.selectedArtifactTab === tab ? "active" : "") + '" data-artifact-tab="' + tab + '">' + escapeHtml(titleCase(tab)) + (counts[tab] ? ' <span class="tab-count">' + counts[tab] + "</span>" : "") + "</button>").join("") + "</nav>";
+}
+
+function renderSelectedArtifactTab(artifact) {
+  if (state.selectedArtifactTab === "preview") return renderArtifactPreview(artifact);
+  if (state.selectedArtifactTab === "access") return renderArtifactAccessTab(artifact);
+  if (state.selectedArtifactTab === "policy") return renderArtifactPolicyTab(artifact);
+  if (state.selectedArtifactTab === "audit") return renderArtifactAuditTab(artifact);
+  if (state.selectedArtifactTab === "versions") return renderArtifactVersionsTab(artifact);
+  return renderArtifactOverviewTab(artifact);
+}
+
+function renderArtifactOverviewTab(artifact) {
+  return (
+    '<div class="overview-grid">' +
+    "<div><span>Department</span><strong>" + escapeHtml(artifact.department) + "</strong></div>" +
+    "<div><span>Policy Status</span><strong>" + escapeHtml(artifact.policyStatusLabel) + "</strong></div>" +
+    "<div><span>Content Hash</span><strong>" + escapeHtml(String(artifact.contentHash || "").slice(0, 10)) + "</strong></div>" +
+    "<div><span>SLA</span><strong>" + escapeHtml(titleCase(artifact.slaStatus)) + "</strong></div>" +
+    "</div>" +
+    '<p class="artifact-summary-copy">' + escapeHtml(artifact.summary || "Governed artifact generated from an enterprise workflow run.") + "</p>"
+  );
+}
+
+function renderArtifactPreview(artifact) {
+  return (
+    '<div class="artifact-preview-layout">' +
+    '<div class="artifact-preview-card"><strong>' + escapeHtml(artifact.name) + '</strong><span></span><span></span><span></span><span class="short"></span><span></span><span class="short"></span>' +
+    (artifact.needsReview ? '<em>⚠ Contains policy-sensitive content</em>' : '<em class="allowed">✓ No active content warnings</em>') +
+    "</div>" +
+    '<div class="policy-summary artifact-preview-checks"><div><span>Allowed</span><strong class="allowed">' + (artifact.policyChecks || []).filter((check) => check.result === "allowed").length + '</strong></div><div><span>Blocked</span><strong class="blocked">' + (artifact.policyChecks || []).filter((check) => check.result === "blocked").length + '</strong></div><div><span>Alerts</span><strong class="alert">' + (artifact.policyChecks || []).filter((check) => check.result === "alert").length + "</strong></div></div>" +
+    "</div>"
+  );
+}
+
+function renderArtifactAccessTab(artifact) {
+  return (
+    '<div class="detail-row"><div><strong>Current access</strong><p>' + escapeHtml(artifact.accessLabel) + '</p></div>' + artifactBadge(artifact.accessLabel, "access", artifact.access) + "</div>" +
+    '<div class="detail-row"><div><strong>Approved audience</strong><p>' + escapeHtml(artifact.approvedAudience || "Team members") + "</p></div></div>" +
+    '<div class="detail-row"><div><strong>Sharing policy</strong><p>' + escapeHtml(artifact.sharingPolicy || "Internal sharing allowed") + "</p></div></div>"
+  );
+}
+
+function renderArtifactPolicyTab(artifact) {
+  const checks = artifact.policyChecks || [];
+  if (!checks.length) return '<p class="empty-copy">No policy checks for this artifact yet.</p>';
+  return checks.map((check) => '<div class="detail-row"><div><strong>' + escapeHtml(check.summary) + '</strong><p>' + escapeHtml(check.action) + '</p></div><strong class="' + escapeHtml(check.result) + '">' + escapeHtml(titleCase(check.result)) + "</strong></div>").join("");
+}
+
+function renderArtifactAuditTab(artifact) {
+  const events = artifact.auditEvents || [];
+  if (!events.length) return '<p class="empty-copy">No audit events for this artifact yet.</p>';
+  return '<div class="artifact-audit-timeline">' + events.map((event) => '<div class="artifact-audit-event"><i></i><span>' + escapeHtml(formatClock(event.occurredAt)) + '</span><div><strong>' + escapeHtml(event.action || event.type) + '</strong><p>' + escapeHtml(event.summary || "") + '</p></div><small>' + escapeHtml(event.actor || "") + "</small></div>").join("") + "</div>";
+}
+
+function renderArtifactVersionsTab(artifact) {
+  const current = Number(String(artifact.version || "v1").replace("v", "")) || 1;
+  const versions = Array.from({ length: Math.min(current, 5) }, (_, index) => current - index);
+  return versions.map((version, index) => '<div class="detail-row"><div><strong>v' + version + (index === 0 ? " Current" : "") + '</strong><p>' + escapeHtml(index === 0 ? "Latest governed version" : "Historical retained version") + '</p></div><small>' + escapeHtml(index === 0 ? artifact.updated || relativeTime(artifact.updatedAt) : version + "h ago") + "</small></div>").join("");
 }
 
 function renderIntakePanel(focused) {
@@ -682,6 +1017,22 @@ window.addEventListener("hashchange", () => {
 });
 
 el.app.addEventListener("change", (event) => {
+  const artifactSearch = event.target.closest("[data-artifact-search]");
+  if (artifactSearch) {
+    state.artifactFilters.search = artifactSearch.value;
+    ensureSelectedArtifact(filteredArtifacts());
+    render();
+    return;
+  }
+
+  const artifactFilter = event.target.closest("[data-artifact-filter]");
+  if (artifactFilter) {
+    state.artifactFilters[artifactFilter.dataset.artifactFilter] = artifactFilter.value;
+    ensureSelectedArtifact(filteredArtifacts());
+    render();
+    return;
+  }
+
   const filter = event.target.closest("[data-filter]");
   if (!filter) return;
   state.filters[filter.dataset.filter] = filter.value;
@@ -689,6 +1040,13 @@ el.app.addEventListener("change", (event) => {
 });
 
 el.app.addEventListener("click", async (event) => {
+  const artifactTab = event.target.closest("[data-artifact-tab]");
+  if (artifactTab) {
+    state.selectedArtifactTab = artifactTab.dataset.artifactTab;
+    render();
+    return;
+  }
+
   const tab = event.target.closest("[data-detail-tab]");
   if (tab) {
     state.selectedTab = tab.dataset.detailTab;
@@ -696,8 +1054,15 @@ el.app.addEventListener("click", async (event) => {
     return;
   }
 
-  const row = event.target.closest("[data-workflow-run-id]");
+  const artifactRow = event.target.closest("[data-artifact-id]");
   const actionButton = event.target.closest("[data-action]");
+  if (artifactRow && (!actionButton || actionButton.dataset.action === "select-artifact")) {
+    state.selectedArtifactId = artifactRow.dataset.artifactId;
+    render();
+    return;
+  }
+
+  const row = event.target.closest("[data-workflow-run-id]");
   if (row && (!actionButton || actionButton.dataset.action === "select-run")) {
     state.selectedWorkflowRunId = row.dataset.workflowRunId;
     render();
@@ -716,8 +1081,15 @@ el.app.addEventListener("click", async (event) => {
   } else if (action === "clear-filters") {
     state.filters = { status: "all", agent: "all", risk: "all", owner: "all", department: "all", duration: "any", humanAction: "all", sla: "all" };
     render();
+  } else if (action === "clear-artifact-filters") {
+    state.artifactFilters = { search: "", type: "all", classification: "all", owner: "all", access: "all", policyStatus: "all", department: "all", date: "any", needsReview: "all", sla: "all" };
+    ensureSelectedArtifact(filteredArtifacts());
+    render();
   } else if (action === "close-drawer") {
     state.selectedWorkflowRunId = null;
+    render();
+  } else if (action === "close-artifact-drawer") {
+    state.selectedArtifactId = null;
     render();
   }
 });
