@@ -14,20 +14,18 @@
       </div>
 
       <nav class="side-nav" aria-label="Primary">
-        <a class="active" href="#">⌂ Home</a>
+        <a class="active" href="#" data-route="home">⌂ Home</a>
         <p>Work</p>
-        <a href="#workboard">▧ Work Items</a>
-        <a href="#agentRuns">⌘ Agent Runs</a>
-        <a href="#approvals">◇ Approvals</a>
-        <a href="#delegation">⇄ Delegation</a>
+        <a href="#workboard" data-route="workboard">▧ Work Items</a>
+        <a href="#agentRuns" data-route="agentRuns">▷ Agent Runs</a>
         <p>Governance</p>
-        <a href="#artifacts">▣ Artifacts</a>
-        <a href="#policyAudit">⬡ Policies</a>
-        <a href="#policyAudit">◉ Audit</a>
+        <a href="#artifacts" data-route="artifacts">▣ Artifacts</a>
+        <a href="#policyAudit" data-route="policyAudit">⬡ Policies</a>
+        <a href="#audit" data-route="audit">◉ Audit</a>
         <p>Admin</p>
-        <a href="#settings">⚙ Settings</a>
-        <a href="#settings">⛓ Integrations</a>
-        <a href="#settings">♙ People & Teams</a>
+        <a href="#settings" data-route="settings">⚙ Settings</a>
+        <a href="#settings" data-route="settings">⛓ Integrations</a>
+        <a href="#settings" data-route="settings">♙ People & Teams</a>
       </nav>
 
       <div class="environment-card">
@@ -41,17 +39,17 @@
     <div class="app-shell">
       <header class="topbar">
         <nav class="top-nav">
-          <a class="active" href="#">⌂ Home</a>
-          <a href="#workboard">⌘ Workboard</a>
-          <a href="#agentRuns">♙ Agents</a>
-          <a href="#policyAudit">⬡ Policies</a>
-          <a href="#policyAudit">▥ Analytics</a>
-          <a href="#artifacts">▤ Catalog</a>
+          <a class="active" href="#" data-route="home">⌂ Home</a>
+          <a href="#workboard" data-route="workboard">⌘ Workbench</a>
+          <a href="#agentRuns" data-route="agentRuns">♙ Agent Runs</a>
+          <a href="#policyAudit" data-route="policyAudit">⬡ Policies</a>
+          <a href="#analytics" data-route="analytics">▥ Analytics</a>
+          <a href="#artifacts" data-route="artifacts">▤ Catalog</a>
         </nav>
 
         <div class="top-actions">
           <div class="search">⌕ <span>Search...</span><kbd>⌘K</kbd></div>
-          <button class="icon-button" aria-label="Notifications">🔔<sup>7</sup></button>
+          <button class="icon-button" aria-label="Notifications">🔔<sup>3</sup></button>
           <button class="icon-button" aria-label="Help">?</button>
           <label class="company-picker">
             🏢
@@ -61,113 +59,7 @@
         </div>
       </header>
 
-      <main class="dashboard">
-        <section class="utility-row">
-          <div></div>
-          <label class="date-filter">
-            📅
-            <select>
-              <option>Last 24 hours</option>
-              <option>Last 7 days</option>
-              <option>Last 30 days</option>
-            </select>
-          </label>
-          <button id="refreshButton" class="icon-button">↻</button>
-        </section>
-
-        <section id="metricGrid" class="metric-grid" aria-label="Metrics"></section>
-
-        <section class="dashboard-grid">
-          <article id="workboard" class="panel span-7">
-            <div class="panel-heading">
-              <h2>Live Workboard <span id="workItemCount" class="count-badge"></span></h2>
-              <a href="#">View all</a>
-            </div>
-            <div id="workboardTable" class="table-card"></div>
-          </article>
-
-          <article id="agentRuns" class="panel span-5">
-            <div class="panel-heading">
-              <h2>Agent Runs <span id="agentRunCount" class="count-badge"></span></h2>
-              <a href="#">View all</a>
-            </div>
-            <div id="agentRunList" class="agent-run-list"></div>
-            <a class="panel-footer-link" href="#">View all agent runs</a>
-          </article>
-
-          <article id="approvals" class="panel span-5">
-            <div class="panel-heading">
-              <h2>Human Approvals <span id="approvalCount" class="count-badge"></span></h2>
-              <a href="#">View all</a>
-            </div>
-            <div id="humanApprovals" class="approval-list"></div>
-            <a class="panel-footer-link" href="#">View all approvals</a>
-          </article>
-
-          <article id="delegation" class="panel span-4">
-            <div class="panel-heading">
-              <h2>Delegation Map</h2>
-              <div class="panel-tools">⌕ ⛶ ↗</div>
-            </div>
-            <div id="delegationMap" class="delegation-map"></div>
-            <div class="legend"><span class="blue"></span>Human <span class="green"></span>Agent <span class="purple"></span>Tool <span class="violet"></span>Service</div>
-          </article>
-
-          <article class="panel span-4">
-            <div class="panel-heading">
-              <h2>Shared Timeline</h2>
-              <span class="live-dot">● Live</span>
-            </div>
-            <div id="sharedTimeline" class="timeline"></div>
-            <a class="panel-footer-link" href="#">View full timeline</a>
-          </article>
-
-          <article id="policyAudit" class="panel span-4">
-            <div class="panel-heading">
-              <h2>Policy & Audit</h2>
-              <a href="#">View all</a>
-            </div>
-            <div class="tabs"><button class="active">Policy Checks</button><button>Audit Log</button></div>
-            <div class="policy-summary">
-              <div><span>All Checks</span><strong>1,248</strong></div>
-              <div><span>Allowed</span><strong>1,186</strong></div>
-              <div><span>Blocked</span><strong>42</strong></div>
-              <div><span>Alerts</span><strong>20</strong></div>
-            </div>
-            <div id="policyChecks" class="policy-checks"></div>
-            <a class="panel-footer-link" href="#">View all policy checks</a>
-          </article>
-
-          <article id="artifacts" class="panel span-5">
-            <div class="panel-heading">
-              <h2>Artifacts</h2>
-              <a href="#">View all</a>
-            </div>
-            <div id="artifactsTable" class="table-card"></div>
-            <a class="panel-footer-link" href="#">View all artifacts</a>
-          </article>
-        </section>
-
-        <section id="settings" class="quick-intake panel">
-          <div>
-            <p class="eyebrow">Demo control</p>
-            <h2>Create procurement work item</h2>
-          </div>
-          <form id="requestForm" class="quick-form">
-            <input name="vendor" placeholder="Vendor" value="Atlas Cloud" required />
-            <input name="amount" type="number" placeholder="Amount" value="12500" required />
-            <input name="department" placeholder="Department" value="Operations" required />
-            <select name="vendorRisk">
-              <option value="low">low risk</option>
-              <option value="medium">medium risk</option>
-              <option value="high" selected>high risk</option>
-              <option value="sanctioned">sanctioned</option>
-            </select>
-            <input name="category" placeholder="Category" value="software" />
-            <button type="submit">Create</button>
-          </form>
-        </section>
-      </main>
+      <main id="app" class="dashboard"></main>
     </div>
 
     <script type="module" src="/app.js"></script>
