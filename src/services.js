@@ -65,6 +65,15 @@ function titleCase(value) {
 export function createAppServices(store) {
   const simulationTimers = new Map();
 
+  function persistInBackground() {
+    const result = store.persist?.();
+    if (result && typeof result.catch === "function") {
+      result.catch((error) => {
+        console.error("Failed to persist dashboard state from background task:", error.message);
+      });
+    }
+  }
+
   function actorFromUserId(userId = "usr_admin") {
     return findById(store.users, userId, "User");
   }
@@ -346,6 +355,7 @@ export function createAppServices(store) {
         } else {
           updateAgentRunProgress({ agentRunId: agentRun.id, progress: step.progress, status: step.status, waitingOn: step.waitingOn });
         }
+        persistInBackground();
       }, delay);
       if (typeof timer.unref === "function") timer.unref();
       simulationTimers.set(agentRun.id, timer);
@@ -1128,161 +1138,7 @@ export function createAppServices(store) {
     return artifact;
   }
 
-  function seedRun({ id, definitionId, title, requesterUserId, request, status, currentStep, agentStatus, progress, waitingOn, artifactTitle }) {
-    const definition = findById(store.workflowDefinitions, definitionId, "WorkflowDefinition");
-    const now = nowIso();
-    const run = {
-      id,
-      workspaceId: definition.workspaceId,
-      workflowDefinitionId: definition.id,
-      type: definition.type,
-      title,
-      status,
-      source: "seed",
-      requesterUserId,
-      request,
-      currentStep,
-      createdAt: now,
-      updatedAt: now
-    };
-    store.workflowRuns.push(run);
-    store.tasks.push({
-      id: createId("task"),
-      workspaceId: run.workspaceId,
-      workflowRunId: run.id,
-      type: "agent_task",
-      status: status === WORKFLOW_STATUS.COMPLETED ? "closed" : "open",
-      assigneeType: "agent",
-      assigneeId: definition.defaultAgentId,
-      title: `${definition.name} agent task`,
-      createdAt: now,
-      updatedAt: now
-    });
-    appendAuditEvent({
-      workspaceId: run.workspaceId,
-      workflowRunId: run.id,
-      actorType: ACTOR_TYPES.USER,
-      actorId: requesterUserId,
-      source: "seed",
-      action: "workflow_run.created",
-      targetType: "WorkflowRun",
-      targetId: run.id,
-      after: run,
-      summary: `${title} created`
-    });
-    createAgentRun({ workflowRun: run, agentId: definition.defaultAgentId, status: agentStatus, progress, waitingOn, simulationMode: false });
-    if (artifactTitle) {
-      createEvidenceArtifact({
-        workspaceId: run.workspaceId,
-        workflowRunId: run.id,
-        kind: "report",
-        title: artifactTitle,
-        ownerType: "agent",
-        ownerId: definition.defaultAgentId,
-        payload: { seeded: true, title: artifactTitle }
-      });
-    }
-    return run;
-  }
-
-  function ensureDemoData() {
-    if (store.workflowRuns.length) return;
-    const contract = seedRun({
-      id: "run_contract_review",
-      definitionId: "wf_contract_review_v1",
-      title: "Vendor Contract Review",
-      requesterUserId: "usr_jane",
-      request: { vendor: "DataScope Inc.", amount: 25000, currency: "USD", department: "Legal", category: "contract", vendorRisk: "high" },
-      status: WORKFLOW_STATUS.AWAITING_AGENT,
-      currentStep: "agent_analysis",
-      agentStatus: "running",
-      progress: 72,
-      artifactTitle: "Contract Summary Draft"
-    });
-    const finance = seedRun({
-      id: "run_financial_variance",
-      definitionId: "wf_financial_analysis_v1",
-      title: "Q2 Financial Variance Analysis",
-      requesterUserId: "usr_mark",
-      request: { vendor: "Internal Finance", amount: 12000, currency: "USD", department: "Finance", category: "budget", vendorRisk: "medium" },
-      status: WORKFLOW_STATUS.AWAITING_AGENT,
-      currentStep: "agent_analysis",
-      agentStatus: "waiting_for_human",
-      progress: 45,
-      waitingOn: "Finance approval",
-      artifactTitle: "Q2 Variance Analysis Report"
-    });
-    seedRun({
-      id: "run_market_brief",
-      definitionId: "wf_market_research_v1",
-      title: "Marketing Campaign Brief",
-      requesterUserId: "usr_sara",
-      request: { vendor: "External Research", amount: 800, currency: "USD", department: "Marketing", category: "research", vendorRisk: "low" },
-      status: WORKFLOW_STATUS.AWAITING_AGENT,
-      currentStep: "agent_research",
-      agentStatus: "waiting_for_tool",
-      progress: 30,
-      waitingOn: "External search tool",
-      artifactTitle: "Marketing Campaign Brief"
-    });
-    seedRun({
-      id: "run_security_triage",
-      definitionId: "wf_security_triage_v1",
-      title: "Security Incident Triage",
-      requesterUserId: "usr_alex",
-      request: { vendor: "Security Stack", amount: 0, currency: "USD", department: "Security", category: "incident", vendorRisk: "high" },
-      status: WORKFLOW_STATUS.AWAITING_AGENT,
-      currentStep: "agent_triage",
-      agentStatus: "running",
-      progress: 65,
-      artifactTitle: "Security Incident Report #742"
-    });
-    const access = seedRun({
-      id: "run_access_review",
-      definitionId: "wf_access_review_v1",
-      title: "IT Access Review — Q2",
-      requesterUserId: "usr_daniel",
-      request: { vendor: "Internal IAM", amount: 0, currency: "USD", department: "IT", category: "access", vendorRisk: "high" },
-      status: WORKFLOW_STATUS.AWAITING_AGENT,
-      currentStep: "agent_review",
-      agentStatus: "running",
-      progress: 90,
-      artifactTitle: "IAM Access Review Results"
-    });
-    const report = seedRun({
-      id: "run_weekly_summary",
-      definitionId: "wf_executive_reporting_v1",
-      title: "Weekly Executive Summary",
-      requesterUserId: "usr_admin",
-      request: { vendor: "Internal Reporting", amount: 0, currency: "USD", department: "Executive", category: "report", vendorRisk: "low" },
-      status: WORKFLOW_STATUS.COMPLETED,
-      currentStep: "artifact",
-      agentStatus: "completed",
-      progress: 100,
-      artifactTitle: "Weekly Executive Summary"
-    });
-    for (const run of [contract, finance, access]) {
-      const agentRun = store.agentRuns.find((entry) => entry.workflowRunId === run.id);
-      const agent = findById(store.agents, agentRun.agentId, "Agent");
-      submitAgentProposal({
-        agent,
-        workflowRunId: run.id,
-        proposal: {
-          actionType: agent.allowedActionTypes[0],
-          connectorId: connectorForAction(agent.allowedActionTypes[0]),
-          summary: `${agent.name} recommends governed review for ${run.title}.`,
-          extractedFields: run.request,
-          confidence: 0.88,
-          payload: { seeded: true }
-        }
-      });
-    }
-    const reportAgentRun = store.agentRuns.find((entry) => entry.workflowRunId === report.id);
-    if (reportAgentRun) reportAgentRun.completedAt = reportAgentRun.completedAt ?? nowIso();
-  }
-
   function bootstrap() {
-    ensureDemoData();
     return {
       workspace: store.workspaces[0],
       users: store.users.map(publicUser),
@@ -1298,8 +1154,6 @@ export function createAppServices(store) {
       tickets: store.tickets
     };
   }
-
-  ensureDemoData();
 
   return {
     store,

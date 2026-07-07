@@ -2,5 +2,6 @@
 .agent-quality/
 .codex/
 .serena/ 
+node_modules/
 
 AGENTS.md

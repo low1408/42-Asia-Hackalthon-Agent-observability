@@ -2,13 +2,18 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createSeedStore } from "./store.js";
 import { createAppServices } from "./services.js";
+import { createMemoryStore, createPostgresStore } from "./postgresStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(__dirname, "../public");
 
-export function createServer({ services = createAppServices(createSeedStore()) } = {}) {
+export async function createDefaultServices() {
+  const store = process.env.DATABASE_URL ? await createPostgresStore() : createMemoryStore();
+  return createAppServices(store);
+}
+
+export function createServer({ services = createAppServices(createMemoryStore()) } = {}) {
   async function parseJson(req) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -29,6 +34,12 @@ export function createServer({ services = createAppServices(createSeedStore()) }
       "cache-control": "no-store"
     });
     res.end(body);
+  }
+
+  async function persistStore() {
+    if (typeof services.store?.persist === "function") {
+      await services.store.persist();
+    }
   }
 
   async function sendStatic(req, res) {
@@ -101,29 +112,31 @@ export function createServer({ services = createAppServices(createSeedStore()) }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "agent-runs" && segments[3] === "progress") {
       const body = await parseJson(req);
-      sendJson(
-        res,
-        200,
-        services.updateAgentRunProgress({
-          agentRunId: segments[2],
-          progress: body.progress,
-          status: body.status,
-          waitingOn: body.waitingOn
-        })
-      );
+      const payload = services.updateAgentRunProgress({
+        agentRunId: segments[2],
+        progress: body.progress,
+        status: body.status,
+        waitingOn: body.waitingOn
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "agent-runs" && segments[3] === "complete") {
       const body = await parseJson(req);
-      sendJson(res, 200, services.completeAgentRun({ agentRunId: segments[2], autoSubmitProposal: body.autoSubmitProposal ?? false }));
+      const payload = services.completeAgentRun({ agentRunId: segments[2], autoSubmitProposal: body.autoSubmitProposal ?? false });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/workflow-runs") {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
-      sendJson(res, 201, services.createWorkflowRun({ actor, source: body.source ?? "ui", title: body.title, request: body.request }));
+      const payload = services.createWorkflowRun({ actor, source: body.source ?? "ui", title: body.title, request: body.request });
+      await persistStore();
+      sendJson(res, 201, payload);
       return;
     }
 
@@ -133,7 +146,9 @@ export function createServer({ services = createAppServices(createSeedStore()) }
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "workflow-runs" && segments[3] === "agent-runs" && segments[4] === "simulate") {
-      sendJson(res, 202, services.startAgentRunSimulation({ workflowRunId: segments[2] }));
+      const payload = services.startAgentRunSimulation({ workflowRunId: segments[2] });
+      await persistStore();
+      sendJson(res, 202, payload);
       return;
     }
 
@@ -145,7 +160,9 @@ export function createServer({ services = createAppServices(createSeedStore()) }
 
     if (method === "GET" && segments[0] === "api" && segments[1] === "workflow-runs" && segments[3] === "audit-export") {
       const actor = userFromHeaders(req);
-      sendJson(res, 200, services.auditExport({ actor, workflowRunId: segments[2] }));
+      const payload = services.auditExport({ actor, workflowRunId: segments[2] });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
@@ -158,32 +175,28 @@ export function createServer({ services = createAppServices(createSeedStore()) }
       const body = await parseJson(req);
       const token = req.headers["x-agent-token"] || body.agentToken;
       const agent = services.agentFromId(segments[2], token);
-      sendJson(
-        res,
-        201,
-        services.submitAgentProposal({
-          agent,
-          workflowRunId: body.workflowRunId,
-          proposal: body.proposal
-        })
-      );
+      const payload = services.submitAgentProposal({
+        agent,
+        workflowRunId: body.workflowRunId,
+        proposal: body.proposal
+      });
+      await persistStore();
+      sendJson(res, 201, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "approval-requests" && segments[3] === "approve") {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
-      sendJson(
-        res,
-        200,
-        services.applyApprovalDecision({
-          actor,
-          approvalRequestId: segments[2],
-          decision: "approved",
-          comment: body.comment,
-          overrideReason: body.overrideReason
-        })
-      );
+      const payload = services.applyApprovalDecision({
+        actor,
+        approvalRequestId: segments[2],
+        decision: "approved",
+        comment: body.comment,
+        overrideReason: body.overrideReason
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
@@ -195,23 +208,23 @@ export function createServer({ services = createAppServices(createSeedStore()) }
     if (method === "POST" && segments[0] === "api" && segments[1] === "approval-requests" && segments[3] === "reject") {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
-      sendJson(
-        res,
-        200,
-        services.applyApprovalDecision({
-          actor,
-          approvalRequestId: segments[2],
-          decision: "rejected",
-          comment: body.comment,
-          overrideReason: body.overrideReason
-        })
-      );
+      const payload = services.applyApprovalDecision({
+        actor,
+        approvalRequestId: segments[2],
+        decision: "rejected",
+        comment: body.comment,
+        overrideReason: body.overrideReason
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "tool-actions" && segments[3] === "execute") {
       const actor = userFromHeaders(req);
-      sendJson(res, 200, services.executeToolAction({ actor, toolActionProposalId: segments[2] }));
+      const payload = services.executeToolAction({ actor, toolActionProposalId: segments[2] });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
@@ -243,21 +256,21 @@ export function createServer({ services = createAppServices(createSeedStore()) }
     if (method === "PUT" && segments[0] === "api" && segments[1] === "policy-rules" && segments.length === 3) {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
-      sendJson(res, 200, services.updatePolicyRule({ actor, ruleId: segments[2], patch: body }));
+      const payload = services.updatePolicyRule({ actor, ruleId: segments[2], patch: body });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/webhooks/events") {
       const body = await parseJson(req);
-      sendJson(
-        res,
-        202,
-        services.receiveWebhookEvent({
-          source: body.source ?? "webhook",
-          eventType: body.eventType,
-          payload: body.payload ?? {}
-        })
-      );
+      const payload = services.receiveWebhookEvent({
+        source: body.source ?? "webhook",
+        eventType: body.eventType,
+        payload: body.payload ?? {}
+      });
+      await persistStore();
+      sendJson(res, 202, payload);
       return;
     }
 
@@ -282,7 +295,9 @@ export function createServer({ services = createAppServices(createSeedStore()) }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT ?? 3010);
-  createServer().listen(port, () => {
-    console.log(`Enterprise Agent-Human Collaboration Layer listening on http://localhost:${port}`);
+  const services = await createDefaultServices();
+  createServer({ services }).listen(port, () => {
+    const storage = services.store.storage?.type ?? "memory";
+    console.log(`Enterprise Agent-Human Collaboration Layer listening on http://localhost:${port} using ${storage} storage`);
   });
 }

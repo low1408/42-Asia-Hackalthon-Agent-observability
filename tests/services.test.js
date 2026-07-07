@@ -193,22 +193,25 @@ test("dashboard read model is computed from real domain records", () => {
 });
 
 test("artifact read model includes linked workflow and governance metadata", () => {
-  const { services } = createHarness();
-  const artifacts = services.listArtifacts();
-  const contract = artifacts.find((artifact) => artifact.name === "Contract Summary Draft");
+  const { services, requester, agent } = createHarness();
+  const run = createRun(services, requester, { vendor: "ArtifactCo", amount: 3000, vendorRisk: "medium" });
+  submitProposal(services, agent, run);
 
-  assert.ok(contract);
-  assert.equal(contract.linkedWorkItemTitle, "Vendor Contract Review");
-  assert.equal(contract.department, "Legal");
-  assert.equal(contract.classification, "confidential");
-  assert.equal(contract.access, "restricted");
-  assert.equal(contract.policyStatus, "pending_review");
-  assert.equal(contract.dataSource, "Contract DB + DocuSign");
-  assert.equal(contract.approvedAudience, "Legal Counsel, Contract Owner");
-  assert.match(contract.version, /^v[1-7]$/);
-  assert.equal(Array.isArray(contract.policyChecks), true);
-  assert.equal(Array.isArray(contract.auditEvents), true);
-  assert.equal(contract.auditEvents.some((event) => event.action === "artifact.created"), true);
+  const artifacts = services.listArtifacts();
+  const proposalArtifact = artifacts.find((artifact) => artifact.workflowRunId === run.id && artifact.type === "Agent Proposal");
+
+  assert.ok(proposalArtifact);
+  assert.equal(proposalArtifact.linkedWorkItemTitle, "Test procurement request");
+  assert.equal(proposalArtifact.department, "Operations");
+  assert.equal(proposalArtifact.classification, "confidential");
+  assert.equal(proposalArtifact.access, "restricted");
+  assert.equal(proposalArtifact.policyStatus, "pending_review");
+  assert.equal(proposalArtifact.dataSource, "Lightweight Purchase Request System");
+  assert.equal(proposalArtifact.approvedAudience, "Owner, Compliance, Security");
+  assert.match(proposalArtifact.version, /^v[1-7]$/);
+  assert.equal(Array.isArray(proposalArtifact.policyChecks), true);
+  assert.equal(Array.isArray(proposalArtifact.auditEvents), true);
+  assert.equal(proposalArtifact.auditEvents.some((event) => event.action === "artifact.created"), true);
 });
 
 test("agent run lifecycle updates dashboard and timeline", () => {

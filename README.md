@@ -2,14 +2,35 @@
 
 MVP implementation of a cloud SaaS operating surface where humans, bring-your-own agents, and enterprise tools collaborate on governed procurement workflows.
 
-The app intentionally uses zero runtime dependencies so it can run in restricted environments:
+The app uses a small Node HTTP API, a vanilla browser UI, and Postgres-backed persistence when `DATABASE_URL` is configured:
 
 - Node HTTP API
-- In-memory seed store
+- Postgres dashboard state store via `pg`
+- In-memory fallback when `DATABASE_URL` is not set
 - Vanilla browser UI
 - Node built-in test runner
 
 ## Run
+
+For a persistent local dashboard, start Postgres first:
+
+```bash
+docker compose up -d postgres
+```
+
+Then start the app with a database URL:
+
+```bash
+DATABASE_URL=postgres://agent_dashboard:agent_dashboard@localhost:5432/agent_dashboard npm start
+```
+
+The app creates the `enterprise_dashboard_state` table automatically. To intentionally wipe persisted runtime dashboard data, start once with:
+
+```bash
+RESET_DASHBOARD_DATA=true DATABASE_URL=postgres://agent_dashboard:agent_dashboard@localhost:5432/agent_dashboard npm start
+```
+
+Without `DATABASE_URL`, the app still runs with the in-memory fallback:
 
 ```bash
 npm start
@@ -48,6 +69,9 @@ The UI includes an actor picker:
 - Audit trail and JSON audit export.
 - Basic RBAC for requester, approver, operator, auditor, and admin roles.
 - Admin policy enable/disable controls.
+- Postgres-backed dashboard state persistence when configured.
+
+The dashboard starts without preloaded workflow-run mock data. Static reference data such as demo actors, agents, connectors, workflow definitions, and policy rules remains available so the frontend can create real runs through the intake/API flows.
 
 ## Service-backed dashboard APIs
 
@@ -95,4 +119,4 @@ curl http://localhost:3010/api/workflow-runs/RUN_ID/audit-export \
 
 ## Notes for production hardening
 
-This MVP keeps data in memory. Production work should replace the store with a transactional database, add real SSO/OIDC, configure managed secret storage, persist connector credentials, enforce tenant isolation at query boundaries, and move audit events to immutable storage.
+This MVP persists the dashboard state as a single JSONB document in Postgres to keep the current service layer compact. Production work should normalize core entities into transactional tables, add real SSO/OIDC, configure managed secret storage, persist connector credentials, enforce tenant isolation at query boundaries, and move audit events to immutable storage.
