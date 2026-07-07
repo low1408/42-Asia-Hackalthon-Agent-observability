@@ -3,5 +3,7 @@
 .codex/
 .serena/ 
 node_modules/
+quorum/
 
 AGENTS.md
+

@@ -717,8 +717,12 @@ export function createAppServices(store) {
     };
   }
 
-  function listWorkflowRuns() {
-    return store.workflowRuns.map((run) => getWorkflowRun(run.id)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  function listWorkflowRuns(since) {
+    let runs = store.workflowRuns;
+    if (since) {
+      runs = runs.filter((run) => run.updatedAt >= since || run.createdAt >= since);
+    }
+    return runs.map((run) => getWorkflowRun(run.id)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   function getAgentRun(idOrRun) {
@@ -728,7 +732,11 @@ export function createAppServices(store) {
   }
 
   function listAgentRuns(filters = {}) {
-    return store.agentRuns
+    let runs = store.agentRuns;
+    if (filters.since) {
+      runs = runs.filter((run) => run.updatedAt >= filters.since || run.startedAt >= filters.since || run.completedAt >= filters.since);
+    }
+    return runs
       .filter((run) => !filters.status || run.status === filters.status)
       .map(getAgentRun)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -758,7 +766,11 @@ export function createAppServices(store) {
   }
 
   function listWorkItems(filters = {}) {
-    return store.workflowRuns
+    let runs = store.workflowRuns;
+    if (filters.since) {
+      runs = runs.filter((run) => run.updatedAt >= filters.since || run.createdAt >= filters.since);
+    }
+    return runs
       .map(workItemFromRun)
       .filter((item) => !filters.status || item.status === filters.status)
       .filter((item) => !filters.risk || item.risk === filters.risk)
@@ -794,8 +806,12 @@ export function createAppServices(store) {
       });
   }
 
-  function listTimeline() {
-    return [...store.auditEvents]
+  function listTimeline(since) {
+    let events = store.auditEvents;
+    if (since) {
+      events = events.filter((event) => event.occurredAt >= since);
+    }
+    return [...events]
       .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
       .slice(0, 30)
       .map((event) => ({
@@ -809,8 +825,12 @@ export function createAppServices(store) {
       }));
   }
 
-  function listPolicyChecks() {
-    return [...store.policyChecks]
+  function listPolicyChecks(since) {
+    let checks = store.policyChecks;
+    if (since) {
+      checks = checks.filter((check) => check.occurredAt >= since);
+    }
+    return [...checks]
       .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
       .map((check) => ({ ...check, ago: relativeTime(check.occurredAt) }));
   }
@@ -900,8 +920,12 @@ export function createAppServices(store) {
     return event.actorId;
   }
 
-  function listArtifacts() {
-    return [...store.evidenceArtifacts]
+  function listArtifacts(since) {
+    let artifacts = store.evidenceArtifacts;
+    if (since) {
+      artifacts = artifacts.filter((art) => art.updatedAt >= since || art.createdAt >= since);
+    }
+    return [...artifacts]
       .sort((a, b) => artifactSortRank(a) - artifactSortRank(b) || artifactWorkflowSortRank(a) - artifactWorkflowSortRank(b) || b.updatedAt.localeCompare(a.updatedAt))
       .map((artifact) => {
         const run = store.workflowRuns.find((entry) => entry.id === artifact.workflowRunId);
@@ -961,7 +985,7 @@ export function createAppServices(store) {
           sharingPolicy: access.value === "restricted" ? "External sharing requires approval" : access.value === "shared" ? "External sharing allowed for approved audience" : "Internal sharing allowed",
           retentionPolicy: run?.type === "contract_review" ? "7 years" : "365 days",
           needsReview: policyStatus.value !== "compliant",
-          slaStatus: pendingApproval && new Date(pendingApproval.dueAt).getTime() < Date.now() ? "breached" : "healthy",
+          slaStatus: pendingApproval && pendingApproval.dueAt && !Number.isNaN(new Date(pendingApproval.dueAt).getTime()) && new Date(pendingApproval.dueAt).getTime() < Date.now() ? "breached" : "healthy",
           waitingOn,
           summary: artifact.kind === "agent_proposal" ? proposal?.summary : `Generated artifact for ${run?.title ?? "workflow"}.`,
           policyChecks: policyChecks.map((check) => ({ ...check, ago: relativeTime(check.occurredAt) })),
@@ -1186,6 +1210,7 @@ export function createAppServices(store) {
     evaluatePolicy,
     updatePolicyRule,
     receiveWebhookEvent,
-    bootstrap
+    bootstrap,
+    dashboardMetrics
   };
 }

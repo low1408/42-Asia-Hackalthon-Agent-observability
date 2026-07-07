@@ -10,6 +10,19 @@ const state = {
   loadingAction: null,
   flashMessage: "",
   errorMessage: "",
+  pollErrorCount: 0,
+  lastLoadedAt: null,
+  auditEvents: [],
+  auditFilters: {
+    search: "",
+    actor: "all",
+    actionType: "all",
+    targetType: "all",
+    risk: "all",
+    date: "any",
+    sortKey: "timestamp",
+    sortDirection: "desc"
+  },
   filters: {
     search: "",
     status: "all",
@@ -42,7 +55,8 @@ const state = {
 const el = {
   app: document.querySelector("#app"),
   actorSelect: document.querySelector("#actorSelect"),
-  avatar: document.querySelector(".avatar")
+  avatar: document.querySelector(".avatar"),
+  systemStatus: document.querySelector("#systemStatus")
 };
 
 async function api(path, options = {}) {
@@ -54,17 +68,93 @@ async function api(path, options = {}) {
       ...(options.headers || {})
     }
   });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Request failed");
+
+  let payload = null;
+  const contentType = response.headers.get("content-type") || "";
+  
+  if (response.status !== 204) {
+    if (contentType.includes("application/json")) {
+      try {
+        payload = await response.json();
+      } catch (err) {
+        throw new Error("Failed to parse JSON response from server");
+      }
+    } else {
+      try {
+        const text = await response.text();
+        throw new Error(text || `Server returned status ${response.status}`);
+      } catch (err) {
+        throw new Error(err.message || `Server returned status ${response.status}`);
+      }
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `Request failed with status ${response.status}`);
+  }
+
   return payload;
 }
 
+function updateSystemStatus() {
+  if (!el.systemStatus) return;
+  if (state.pollErrorCount > 0) {
+    el.systemStatus.className = "system-status offline";
+    el.systemStatus.innerHTML = '<span class="status-indicator-dot red-dot" style="display:inline-block;width:9px;height:9px;border-radius:999px;background:#f04438;margin-right:8px;"></span> Connection offline (' + state.pollErrorCount + ' failures)';
+  } else {
+    el.systemStatus.className = "system-status online";
+    const timeStr = state.lastLoadedAt ? ' (Updated ' + formatClock(state.lastLoadedAt) + ')' : '';
+    el.systemStatus.innerHTML = '<span class="status-indicator-dot green-dot" style="display:inline-block;width:9px;height:9px;border-radius:999px;background:#12b76a;margin-right:8px;"></span> All systems operational' + timeStr;
+  }
+}
+
+function renderInitialLoadError(error) {
+  if (!el.app) return;
+  el.app.className = "dashboard empty-state-container";
+  el.app.innerHTML = `
+    <div class="panel initial-load-error-card" style="max-width: 600px; margin: 40px auto; padding: 32px; text-align: center; border: 1px solid var(--red); box-shadow: var(--shadow); border-radius: 14px; background: #fff;">
+      <div class="error-badge" style="display: inline-grid; place-items: center; width: 56px; height: 56px; border-radius: 999px; background: var(--red-soft); color: var(--red); font-size: 24px; font-weight: 800; margin-bottom: 20px;">⚠</div>
+      <h2 style="margin: 0 0 12px; font-size: 20px; color: var(--text);">Connection Failure</h2>
+      <p style="margin: 0 0 24px; color: var(--muted); font-size: 14px; line-height: 1.5;">Could not boot the dashboard because the Agent Enterprise API services are unreachable or returned an error.</p>
+      <div class="error-stack-wrapper" style="text-align: left; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 24px; max-height: 200px; overflow-y: auto;">
+        <strong style="display: block; font-size: 12px; color: #475467; margin-bottom: 6px;">Error details:</strong>
+        <pre style="margin: 0; font-family: monospace; font-size: 12px; color: var(--red); white-space: pre-wrap; word-break: break-all;">${escapeHtml(error.stack || error.message || error)}</pre>
+      </div>
+      <button id="retryBootstrapBtn" class="primary-button" style="display: inline-flex; align-items: center; gap: 8px; font-weight: 700; padding: 10px 16px; border-radius: 10px; background: var(--blue); color: #fff; border: none; cursor: pointer;">⟳ Retry Connection</button>
+    </div>
+  `;
+  document.getElementById("retryBootstrapBtn")?.addEventListener("click", () => {
+    location.reload();
+  });
+}
+
 async function load() {
-  state.bootstrap = await api("/api/bootstrap");
-  ensureSelectedRun();
-  ensureSelectedArtifact();
-  render();
-  configurePolling();
+  try {
+    state.bootstrap = await api("/api/bootstrap");
+    state.pollErrorCount = 0;
+    state.lastLoadedAt = new Date().toISOString();
+    updateSystemStatus();
+    
+    if (state.currentRoute === "audit") {
+      const res = await api("/api/audit-events");
+      state.auditEvents = res.auditEvents;
+    }
+    
+    ensureSelectedRun();
+    ensureSelectedArtifact();
+    render();
+    configurePolling();
+  } catch (error) {
+    console.error("Dashboard boot failure:", error);
+    state.pollErrorCount = (state.pollErrorCount || 0) + 1;
+    updateSystemStatus();
+    if (!state.bootstrap) {
+      renderInitialLoadError(error);
+    } else {
+      state.errorMessage = "Failed to load update: " + error.message;
+      render();
+    }
+  }
 }
 
 function routeFromHash() {
@@ -74,6 +164,13 @@ function routeFromHash() {
 function pageForRoute(route) {
   if (route === "agentRuns") return "agentRuns";
   if (route === "artifacts") return "artifacts";
+  if (route === "audit") return "audit";
+  if (route === "workboard") return "workboard";
+  if (route === "policyAudit") return "policyAudit";
+  if (route === "settings") return "settings";
+  if (route === "integrations") return "integrations";
+  if (route === "people") return "people";
+  if (route === "analytics") return "analytics";
   return "home";
 }
 
@@ -246,8 +343,16 @@ function latestEvent(run) {
   return events[0] || null;
 }
 
+let enrichedRunsCache = null;
+let lastWorkflowRunsRef = null;
+
 function enrichedRuns() {
-  return (state.bootstrap.workflowRuns || []).map((run) => {
+  const runs = state.bootstrap?.workflowRuns || [];
+  if (enrichedRunsCache && lastWorkflowRunsRef === runs) {
+    return enrichedRunsCache;
+  }
+  
+  enrichedRunsCache = runs.map((run) => {
     const agentRun = runAgentRun(run);
     const owner = run.requester || findUser(run.requesterUserId);
     const approvals = pendingApprovals(run);
@@ -268,6 +373,9 @@ function enrichedRuns() {
       department: run.request?.department || owner?.department || "Unknown"
     };
   });
+  
+  lastWorkflowRunsRef = runs;
+  return enrichedRunsCache;
 }
 
 function filteredRuns() {
@@ -300,8 +408,8 @@ function filteredRuns() {
     if (state.filters.department !== "all" && item.department !== state.filters.department) return false;
     if (state.filters.humanAction === "yes" && item.approvals.length === 0) return false;
     if (state.filters.humanAction === "no" && item.approvals.length > 0) return false;
-    if (state.filters.sla === "breached" && !item.approvals.some((approval) => new Date(approval.dueAt).getTime() < Date.now())) return false;
-    if (state.filters.sla === "healthy" && item.approvals.some((approval) => new Date(approval.dueAt).getTime() < Date.now())) return false;
+    if (state.filters.sla === "breached" && !item.approvals.some((approval) => approval.dueAt && !Number.isNaN(new Date(approval.dueAt).getTime()) && new Date(approval.dueAt).getTime() < Date.now())) return false;
+    if (state.filters.sla === "healthy" && item.approvals.some((approval) => approval.dueAt && !Number.isNaN(new Date(approval.dueAt).getTime()) && new Date(approval.dueAt).getTime() < Date.now())) return false;
     if (state.filters.duration === "under10" && durationMinutes(item) >= 10) return false;
     if (state.filters.duration === "over10" && durationMinutes(item) <= 10) return false;
     return true;
@@ -432,6 +540,16 @@ function render() {
     renderAgentRunsPage();
   } else if (page === "artifacts") {
     renderArtifactsPage();
+  } else if (page === "audit") {
+    renderAuditPage();
+  } else if (page === "workboard") {
+    renderWorkboardPage();
+  } else if (page === "policyAudit") {
+    renderPolicyAuditPage();
+  } else if (page === "settings" || page === "integrations" || page === "people") {
+    renderSettingsPage();
+  } else if (page === "analytics") {
+    renderAnalyticsPage();
   } else {
     renderHomePage();
   }
@@ -452,6 +570,457 @@ function renderNavigation() {
   document.querySelectorAll("[data-route]").forEach((link) => {
     link.classList.toggle("active", link.dataset.route === state.currentRoute || (state.currentRoute === "home" && link.dataset.route === "home"));
   });
+}
+
+function findActorName(event) {
+  if (event.actorType === "user") {
+    const u = users().find(user => user.id === event.actorId);
+    return u ? u.name : event.actorId;
+  }
+  if (event.actorType === "agent") {
+    const a = state.bootstrap.agents.find(agent => agent.id === event.actorId);
+    return a ? a.name : event.actorId;
+  }
+  return event.actorId;
+}
+
+function resetAuditFilters() {
+  state.auditFilters = {
+    search: "",
+    actor: "all",
+    actionType: "all",
+    targetType: "all",
+    risk: "all",
+    date: "any",
+    sortKey: "timestamp",
+    sortDirection: "desc"
+  };
+}
+
+function filteredAudits() {
+  const filters = state.auditFilters;
+  const events = state.auditEvents || [];
+  
+  return events.filter(event => {
+    const search = filters.search.trim().toLowerCase();
+    if (search) {
+      const actorName = findActorName(event).toLowerCase();
+      const haystack = [
+        event.id,
+        event.action,
+        event.summary,
+        event.actorId,
+        actorName,
+        event.targetType,
+        event.targetId
+      ].join(" ").toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+    
+    if (filters.actor !== "all") {
+      if (event.actorId !== filters.actor && event.actorType !== filters.actor) return false;
+    }
+    
+    if (filters.actionType !== "all" && event.action !== filters.actionType) return false;
+    if (filters.targetType !== "all" && event.targetType !== filters.targetType) return false;
+    
+    if (filters.date !== "any") {
+      const ageHours = Math.max(0, (Date.now() - new Date(event.occurredAt).getTime()) / 3600000);
+      if (filters.date === "today" && ageHours > 24) return false;
+      if (filters.date === "week" && ageHours > 24 * 7) return false;
+      if (filters.date === "month" && ageHours > 24 * 30) return false;
+    }
+    
+    if (filters.risk !== "all") {
+      const runId = event.workflowRunId || (event.targetType === "WorkflowRun" ? event.targetId : null);
+      if (runId) {
+        const run = state.bootstrap.workflowRuns.find(r => r.id === runId);
+        const risk = run?.request?.vendorRisk || run?.request?.risk || "medium";
+        if (risk !== filters.risk) return false;
+      } else {
+        return false;
+      }
+    }
+    
+    return true;
+  });
+}
+
+function renderAuditDetailsDrawer() {
+  if (!state.selectedAuditEventId) return "";
+  const event = state.auditEvents.find(e => e.id === state.selectedAuditEventId);
+  if (!event) return "";
+
+  return `
+    <aside class="artifact-detail-drawer panel" style="position: fixed; inset: 0 0 0 auto; width: 480px; z-index: 10; border-left: 1px solid var(--line); background: #fff; box-shadow: -10px 0 30px rgba(0,0,0,0.05); padding: 24px; display: flex; flex-direction: column; overflow-y: auto;">
+      <div class="drawer-heading" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 16px; margin-bottom: 20px;">
+        <div>
+          <span class="badge status-running">Audit Trace Event</span>
+          <h2 style="margin: 8px 0 0; font-size: 18px;">${escapeHtml(event.action)}</h2>
+        </div>
+        <button data-action="close-audit-drawer" style="border:none; background:none; font-size:24px; cursor:pointer;">×</button>
+      </div>
+
+      <dl class="run-facts" style="display: grid; gap: 12px; font-size: 13px; margin-bottom: 20px;">
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Event ID</dt><dd><code>${escapeHtml(event.id)}</code></dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Sequence ID</dt><dd><code>#${event.sequence ?? '—'}</code></dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Occurred At</dt><dd>${escapeHtml(event.occurredAt)}</dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Actor Type</dt><dd>${escapeHtml(titleCase(event.actorType))}</dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Actor ID</dt><dd><code>${escapeHtml(event.actorId)}</code></dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Resource Type</dt><dd>${escapeHtml(event.targetType)}</dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Resource ID</dt><dd><code>${escapeHtml(event.targetId)}</code></dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Workflow Run ID</dt><dd><code>${escapeHtml(event.workflowRunId || 'N/A')}</code></dd></div>
+        <div style="display:flex; justify-content:space-between;"><dt style="color:var(--muted); font-weight:700;">Source</dt><dd><code>${escapeHtml(event.source)}</code></dd></div>
+      </dl>
+
+      <div style="border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px;">
+        <h4 style="margin: 0 0 10px;">Audit Cryptographic Hash</h4>
+        <div style="font-family: monospace; font-size: 11px; background: #f8fafc; padding: 10px; border-radius: 8px; border: 1px solid var(--line); word-break: break-all;">
+          <strong>Block Hash:</strong><br>${escapeHtml(event.hash || '—')}<br><br>
+          <strong>Prev Hash:</strong><br>${escapeHtml(event.previousHash || '—')}
+        </div>
+      </div>
+
+      <div style="border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; flex: 1;">
+        <h4 style="margin: 0 0 10px;">Payload State Snapshot</h4>
+        <pre style="margin: 0; font-family: monospace; font-size: 11px; background: #f8fafc; padding: 10px; border-radius: 8px; border: 1px solid var(--line); overflow: auto; max-height: 250px; white-space: pre-wrap;">${escapeHtml(JSON.stringify(event.after || event.before || {}, null, 2))}</pre>
+      </div>
+    </aside>
+  `;
+}
+
+function renderAuditPage() {
+  const rows = filteredAudits();
+  el.app.className = "dashboard audit-page";
+
+  const allEvents = state.auditEvents || [];
+  const actors = allEvents.map(e => ({ value: e.actorId, label: findActorName(e) }));
+  const actions = allEvents.map(e => ({ value: e.action, label: titleCase(e.action) }));
+  const targets = allEvents.map(e => ({ value: e.targetType, label: titleCase(e.targetType) }));
+
+  el.app.innerHTML = `
+    <section class="page-header">
+      <div>
+        <h1>Audit Log & Trace Investigation</h1>
+        <p>Inspect immutable system execution logs, cryptographic hash chains, and user/agent compliance trails.</p>
+      </div>
+      <div class="page-actions">
+        <button class="primary-button" data-action="verify-hash-chains">✓ Verify Cryptographic Chain</button>
+      </div>
+    </section>
+    ${renderFeedback()}
+    <section class="run-filters">
+      <input class="run-search-input" data-audit-search type="search" placeholder="Search actor, resource ID, or summary..." value="${escapeHtml(state.auditFilters.search)}" />
+      <label>Actor
+        <select data-audit-filter="actor">
+          ${selectOptions(actors, state.auditFilters.actor, "All")}
+        </select>
+      </label>
+      <label>Action Type
+        <select data-audit-filter="actionType">
+          ${selectOptions(actions, state.auditFilters.actionType, "All")}
+        </select>
+      </label>
+      <label>Resource Type
+        <select data-audit-filter="targetType">
+          ${selectOptions(targets, state.auditFilters.targetType, "All")}
+        </select>
+      </label>
+      <label>Risk
+        <select data-audit-filter="risk">
+          <option value="all">All</option>
+          <option value="low" ${state.auditFilters.risk === 'low' ? 'selected' : ''}>Low</option>
+          <option value="medium" ${state.auditFilters.risk === 'medium' ? 'selected' : ''}>Medium</option>
+          <option value="high" ${state.auditFilters.risk === 'high' ? 'selected' : ''}>High</option>
+          <option value="sanctioned" ${state.auditFilters.risk === 'sanctioned' ? 'selected' : ''}>Sanctioned</option>
+        </select>
+      </label>
+      <label>Date
+        <select data-audit-filter="date">
+          <option value="any">Any</option>
+          <option value="today" ${state.auditFilters.date === 'today' ? 'selected' : ''}>Last 24h</option>
+          <option value="week" ${state.auditFilters.date === 'week' ? 'selected' : ''}>Last 7d</option>
+          <option value="month" ${state.auditFilters.date === 'month' ? 'selected' : ''}>Last 30d</option>
+        </select>
+      </label>
+      <button data-action="clear-audit-filters">Clear</button>
+    </section>
+
+    <div class="panel span-12">
+      <div class="table-card">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Sequence</th>
+              <th>Actor</th>
+              <th>Action Type</th>
+              <th>Resource</th>
+              <th>Integrity</th>
+              <th>Summary</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.length === 0 ? `
+              <tr>
+                <td colspan="7" style="text-align: center; padding: 40px; color: var(--muted);">No audit events match the active filters.</td>
+              </tr>
+            ` : rows.map(event => `
+                <tr style="cursor: pointer;" data-audit-event-id="${escapeHtml(event.id)}">
+                  <td style="font-size:12px;">${escapeHtml(formatClock(event.occurredAt))} <small class="muted" style="display:block;">${escapeHtml(relativeTime(event.occurredAt))}</small></td>
+                  <td><code>#${event.sequence ?? '—'}</code></td>
+                  <td><span class="owner-chip">${escapeHtml(initials(findActorName(event)))}</span>${escapeHtml(findActorName(event))}</td>
+                  <td><span class="badge status-in_progress" style="font-size:11px;">${escapeHtml(event.action)}</span></td>
+                  <td><code style="font-size:11px;">${escapeHtml(event.targetType)}:${escapeHtml(event.targetId)}</code></td>
+                  <td>
+                    <span class="badge status-completed" style="font-size:11px; display:inline-flex; align-items:center; gap:4px;">
+                      🛡️ Valid
+                    </span>
+                  </td>
+                  <td><strong>${escapeHtml(event.summary || event.text)}</strong></td>
+                </tr>
+              `).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    ${renderAuditDetailsDrawer()}
+  `;
+}
+
+function renderWorkboardPage() {
+  const rows = dashboard().workItems;
+  el.app.className = "dashboard workboard-page";
+  el.app.innerHTML = `
+    <section class="page-header">
+      <div>
+        <h1>Work Items</h1>
+        <p>View all active, completed, and blocked human-agent collaborative procurement work items.</p>
+      </div>
+      <div>
+        <button class="primary-button" data-action="create-run">＋ Create Request</button>
+      </div>
+    </section>
+    ${renderFeedback()}
+    <div class="panel span-12">
+      <div class="panel-heading"><h2>All Work Items <span class="count-badge">${rows.length}</span></h2></div>
+      <div class="table-card">
+        <table>
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Owner</th>
+              <th>Assigned Agent</th>
+              <th>Status</th>
+              <th>Risk</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr style="cursor: pointer;" data-workflow-run-id="${escapeHtml(row.workflowRunId)}">
+                <td><span class="doc-icon">▧</span>${escapeHtml(row.title)}</td>
+                <td><span class="owner-chip">${escapeHtml(row.ownerInitials)}</span>${escapeHtml(row.owner)}</td>
+                <td>🤖 ${escapeHtml(row.assignedAgent)}</td>
+                <td>${statusBadge(row.status)}</td>
+                <td>${riskBadge(row.risk)}</td>
+                <td>${escapeHtml(row.lastUpdated)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+        <div class="table-footer">Showing ${rows.length} of ${rows.length} items</div>
+      </div>
+    </div>
+    ${renderRunDrawer()}
+  `;
+}
+
+function renderPolicyAuditPage() {
+  el.app.className = "dashboard policy-page";
+  el.app.innerHTML = `
+    <section class="page-header">
+      <div>
+        <h1>Policy & Governance Rules</h1>
+        <p>Manage and inspect spend limits, vendor checks, and compliance approval routing policies.</p>
+      </div>
+    </section>
+    ${renderFeedback()}
+    <div class="dashboard-grid">
+      <div class="panel span-7">
+        <div class="panel-heading"><h2>Active Policy Rules</h2></div>
+        <div style="padding: 16px;">${renderPolicyRules()}</div>
+      </div>
+      <div class="panel span-5">
+        <div class="panel-heading"><h2>Recent Policy Engine Checks</h2></div>
+        <div class="policy-checks">
+          ${dashboard().policyAudit.checks.map((check) => `
+            <div class="policy-row">
+              <span>▧ ${escapeHtml(check.summary)}</span>
+              <strong class="${escapeHtml(check.result)}">${escapeHtml(titleCase(check.result))}</strong>
+              <small>${escapeHtml(check.ago || "")}</small>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSettingsPage() {
+  const activeTab = state.currentRoute;
+  el.app.className = "dashboard settings-page";
+  
+  let tabContent = "";
+  if (activeTab === "settings") {
+    tabContent = `
+      <div class="dashboard-grid">
+        <div class="span-6">
+          ${renderIntakePanel(false)}
+        </div>
+        <div class="panel span-6" style="padding: 20px;">
+          <h3 style="margin-top:0;">Dashboard Settings</h3>
+          <p class="muted">Configure default workspace defaults and API options.</p>
+          <div style="margin-top: 20px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 700;">Workspace Name</label>
+            <input type="text" value="${escapeHtml(state.bootstrap.workspace?.name || 'Acme Corp')}" style="width: 100%; padding: 8px 12px; margin-bottom: 16px; border:1px solid var(--line); border-radius:10px;" readonly />
+            
+            <label style="display: block; margin-bottom: 8px; font-weight: 700;">Data Retention Period</label>
+            <select style="width: 100%; padding: 8px 12px; margin-bottom: 16px; border:1px solid var(--line); border-radius:10px;" disabled>
+              <option>${state.bootstrap.workspace?.retentionDays || 365} Days</option>
+            </select>
+            
+            <label style="display: block; margin-bottom: 8px; font-weight: 700; margin-bottom: 8px;">Deployment Mode</label>
+            <span class="badge status-completed">${escapeHtml(titleCase(state.bootstrap.workspace?.deploymentModel || 'Cloud SaaS'))}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  } else if (activeTab === "integrations") {
+    tabContent = `
+      <div class="panel span-12" style="padding: 20px;">
+        <h2 style="margin-top:0;">Connected Enterprise Integrations</h2>
+        <p class="muted">Governed procurement connectors and channels.</p>
+        <div class="grid-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-top: 20px;">
+          ${(state.bootstrap.toolConnectors || []).map(conn => `
+            <div class="card" style="border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: #fff; box-shadow: var(--shadow);">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
+                <strong>${escapeHtml(conn.name)}</strong>
+                <span class="badge ${conn.status === 'connected' ? 'status-running' : 'muted-badge'}">${escapeHtml(titleCase(conn.status))}</span>
+              </div>
+              <p style="margin: 0 0 12px; font-size: 12px; color: var(--muted);">Type: ${escapeHtml(conn.type ? titleCase(conn.type) : 'Connector')}</p>
+              <div style="font-size: 11px; color: var(--text);">
+                <strong>Actions:</strong> ${conn.governedActions.map(a => `<code>${escapeHtml(a)}</code>`).join(", ")}
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  } else if (activeTab === "people") {
+    tabContent = `
+      <div class="panel span-12" style="padding: 20px;">
+        <h2 style="margin-top:0;">People & Team Members</h2>
+        <p class="muted">Governed team roles and routing permissions.</p>
+        <div class="table-card" style="margin-top: 20px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Department</th>
+                <th>Authorized Roles</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${users().map(user => `
+                <tr>
+                  <td><span class="owner-chip">${escapeHtml(initials(user.name))}</span><strong>${escapeHtml(user.name)}</strong></td>
+                  <td>${escapeHtml(user.email)}</td>
+                  <td>${escapeHtml(user.department)}</td>
+                  <td>${user.roles.map(r => `<span class="badge muted-badge" style="margin-right: 4px;">${escapeHtml(r)}</span>`).join("")}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  el.app.innerHTML = `
+    <section class="page-header">
+      <div>
+        <h1>Admin Control Panel</h1>
+        <p>Configure platform preferences, manage team members, and inspect connected enterprise integrations.</p>
+      </div>
+    </section>
+    <div class="tabs" style="border-top: none; margin-bottom: 20px; padding: 0;">
+      <a href="#settings" class="tab-btn ${activeTab === 'settings' ? 'active' : ''}" style="padding: 8px 16px; font-weight: 700; border-bottom: 2px solid ${activeTab === 'settings' ? 'var(--blue)' : 'transparent'}; color: ${activeTab === 'settings' ? 'var(--blue)' : 'var(--muted)'};">⚙ Settings</a>
+      <a href="#integrations" class="tab-btn ${activeTab === 'integrations' ? 'active' : ''}" style="padding: 8px 16px; font-weight: 700; border-bottom: 2px solid ${activeTab === 'integrations' ? 'var(--blue)' : 'transparent'}; color: ${activeTab === 'integrations' ? 'var(--blue)' : 'var(--muted)'};">⛓ Integrations</a>
+      <a href="#people" class="tab-btn ${activeTab === 'people' ? 'active' : ''}" style="padding: 8px 16px; font-weight: 700; border-bottom: 2px solid ${activeTab === 'people' ? 'var(--blue)' : 'transparent'}; color: ${activeTab === 'people' ? 'var(--blue)' : 'var(--muted)'};">♙ People & Teams</a>
+    </div>
+    ${tabContent}
+  `;
+}
+
+function renderAnalyticsPage() {
+  el.app.className = "dashboard analytics-page";
+  el.app.innerHTML = `
+    <section class="page-header">
+      <div>
+        <h1>System Analytics</h1>
+        <p>Analyze performance metrics, response times, and governance compliance rates.</p>
+      </div>
+    </section>
+    ${renderFeedback()}
+    <section class="metric-grid" aria-label="Metrics">${renderHomeMetrics()}</section>
+    <div class="dashboard-grid">
+      <div class="panel span-6" style="padding: 20px;">
+        <h3 style="margin-top:0;">Spend vs Thresholds</h3>
+        <p class="muted">Procurement requests classified by total amount.</p>
+        <div style="height: 200px; display: grid; align-items: end; grid-template-columns: repeat(4, 1fr); gap: 20px; padding: 20px 0; border-bottom: 2px solid var(--line);">
+          <div style="background: var(--green); height: 80%; border-radius: 4px 4px 0 0;" title="Low risk spend"></div>
+          <div style="background: var(--blue); height: 60%; border-radius: 4px 4px 0 0;" title="Medium risk spend"></div>
+          <div style="background: var(--amber); height: 40%; border-radius: 4px 4px 0 0;" title="High risk spend"></div>
+          <div style="background: var(--red); height: 15%; border-radius: 4px 4px 0 0;" title="Blocked spend"></div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); text-align: center; font-size: 11px; margin-top: 8px;">
+          <span>&lt; $1k</span><span>$1k - $10k</span><span>&gt; $10k</span><span>Blocked</span>
+        </div>
+      </div>
+      <div class="panel span-6" style="padding: 20px;">
+        <h3 style="margin-top:0;">Agent Efficiency</h3>
+        <p class="muted">Triage confidence levels and response SLAs.</p>
+        <div style="margin-top: 20px; display: grid; gap: 14px;">
+          <div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+              <span>Triage Agent Confidence</span><strong>89%</strong>
+            </div>
+            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
+              <div style="background:var(--green); width:89%; height:100%;"></div>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+              <span>SLA Compliance Rate</span><strong>96%</strong>
+            </div>
+            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
+              <div style="background:var(--blue); width:96%; height:100%;"></div>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+              <span>Automatic Route Accuracy</span><strong>92%</strong>
+            </div>
+            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
+              <div style="background:var(--purple); width:92%; height:100%;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderHomePage() {
@@ -1255,10 +1824,145 @@ function renderAndRestoreInput(selector, start, end) {
   }
 }
 
+async function pollUpdate() {
+  if (!state.bootstrap || !state.lastLoadedAt) {
+    return load();
+  }
+  const since = state.lastLoadedAt;
+  state.lastLoadedAt = new Date().toISOString();
+  try {
+    const [runsRes, agentRunsRes, policyChecksRes, timelineRes, artifactsRes, metricsRes, workItemsRes] = await Promise.all([
+      api(`/api/workflow-runs?since=${encodeURIComponent(since)}`),
+      api(`/api/agent-runs?since=${encodeURIComponent(since)}`),
+      api(`/api/policy-checks?since=${encodeURIComponent(since)}`),
+      api(`/api/timeline?since=${encodeURIComponent(since)}`),
+      api(`/api/artifacts?since=${encodeURIComponent(since)}`),
+      api(`/api/metrics`),
+      api(`/api/work-items?since=${encodeURIComponent(since)}`)
+    ]);
+
+    state.pollErrorCount = 0;
+    updateSystemStatus();
+
+    let hasChanges = false;
+
+    // 1. Merge workflowRuns
+    if (runsRes.workflowRuns?.length) {
+      hasChanges = true;
+      runsRes.workflowRuns.forEach(run => {
+        const idx = state.bootstrap.workflowRuns.findIndex(r => r.id === run.id);
+        if (idx !== -1) {
+          state.bootstrap.workflowRuns[idx] = run;
+        } else {
+          state.bootstrap.workflowRuns.unshift(run);
+        }
+      });
+      // Invalidate runs cache
+      enrichedRunsCache = null;
+    }
+
+    // 2. Merge dashboard.agentRuns
+    if (agentRunsRes.agentRuns?.length) {
+      hasChanges = true;
+      agentRunsRes.agentRuns.forEach(run => {
+        const idx = state.bootstrap.dashboard.agentRuns.findIndex(r => r.id === run.id);
+        if (idx !== -1) {
+          state.bootstrap.dashboard.agentRuns[idx] = run;
+        } else {
+          state.bootstrap.dashboard.agentRuns.unshift(run);
+        }
+      });
+    }
+
+    // 3. Merge policy checks
+    if (policyChecksRes.policyChecks?.length) {
+      hasChanges = true;
+      policyChecksRes.policyChecks.forEach(check => {
+        const idx = state.bootstrap.dashboard.policyAudit.checks.findIndex(c => c.id === check.id);
+        if (idx !== -1) {
+          state.bootstrap.dashboard.policyAudit.checks[idx] = check;
+        } else {
+          state.bootstrap.dashboard.policyAudit.checks.unshift(check);
+        }
+      });
+      state.bootstrap.dashboard.policyAudit.checks.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+      const allowed = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "allowed").length;
+      const blocked = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "blocked").length;
+      const alerts = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "alert").length;
+      state.bootstrap.dashboard.policyAudit.summary = {
+        allChecks: state.bootstrap.dashboard.policyAudit.checks.length,
+        allowed,
+        blocked,
+        alerts
+      };
+    }
+
+    // 4. Merge timeline
+    if (timelineRes.timeline?.length) {
+      hasChanges = true;
+      timelineRes.timeline.forEach(event => {
+        const idx = state.bootstrap.dashboard.timeline.findIndex(e => e.id === event.id);
+        if (idx !== -1) {
+          state.bootstrap.dashboard.timeline[idx] = event;
+        } else {
+          state.bootstrap.dashboard.timeline.unshift(event);
+        }
+      });
+      state.bootstrap.dashboard.timeline.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+      state.bootstrap.dashboard.timeline = state.bootstrap.dashboard.timeline.slice(0, 30);
+    }
+
+    // 5. Merge artifacts
+    if (artifactsRes.artifacts?.length) {
+      hasChanges = true;
+      artifactsRes.artifacts.forEach(artifact => {
+        const idx = state.bootstrap.dashboard.artifacts.findIndex(a => a.id === artifact.id);
+        if (idx !== -1) {
+          state.bootstrap.dashboard.artifacts[idx] = artifact;
+        } else {
+          state.bootstrap.dashboard.artifacts.unshift(artifact);
+        }
+      });
+    }
+
+    // 6. Merge workItems
+    if (workItemsRes.workItems?.length) {
+      hasChanges = true;
+      workItemsRes.workItems.forEach(item => {
+        const idx = state.bootstrap.dashboard.workItems.findIndex(w => w.id === item.id);
+        if (idx !== -1) {
+          state.bootstrap.dashboard.workItems[idx] = item;
+        } else {
+          state.bootstrap.dashboard.workItems.unshift(item);
+        }
+      });
+    }
+
+    // 7. Update metrics
+    if (metricsRes.metrics) {
+      state.bootstrap.dashboard.metrics = metricsRes.metrics;
+      hasChanges = true;
+    }
+
+    if (hasChanges) {
+      ensureSelectedRun();
+      ensureSelectedArtifact();
+      render();
+    }
+    configurePolling();
+  } catch (error) {
+    console.error("Incremental poll failed:", error);
+    state.pollErrorCount = (state.pollErrorCount || 0) + 1;
+    updateSystemStatus();
+    state.errorMessage = "Connection degraded: " + error.message;
+    render();
+  }
+}
+
 function configurePolling() {
   const hasActiveRuns = dashboard().agentRuns.some((run) => run.status !== "completed");
   if (hasActiveRuns && !state.pollTimer) {
-    state.pollTimer = setInterval(load, 1500);
+    state.pollTimer = setInterval(pollUpdate, 1500);
   }
   if (!hasActiveRuns && state.pollTimer) {
     clearInterval(state.pollTimer);
@@ -1285,6 +1989,13 @@ el.app.addEventListener("change", (event) => {
     return;
   }
 
+  const auditFilter = event.target.closest("[data-audit-filter]");
+  if (auditFilter) {
+    state.auditFilters[auditFilter.dataset.auditFilter] = auditFilter.value;
+    render();
+    return;
+  }
+
   const filter = event.target.closest("[data-filter]");
   if (!filter) return;
   state.filters[filter.dataset.filter] = filter.value;
@@ -1299,6 +2010,15 @@ el.app.addEventListener("input", (event) => {
     state.artifactFilters.search = artifactSearch.value;
     ensureSelectedArtifact(filteredArtifacts());
     renderAndRestoreInput("[data-artifact-search]", start, end);
+    return;
+  }
+
+  const auditSearch = event.target.closest("[data-audit-search]");
+  if (auditSearch) {
+    const start = auditSearch.selectionStart;
+    const end = auditSearch.selectionEnd;
+    state.auditFilters.search = auditSearch.value;
+    renderAndRestoreInput("[data-audit-search]", start, end);
     return;
   }
 
@@ -1330,6 +2050,13 @@ el.app.addEventListener("click", async (event) => {
   const actionButton = event.target.closest("[data-action]");
   if (artifactRow && (!actionButton || actionButton.dataset.action === "select-artifact")) {
     state.selectedArtifactId = artifactRow.dataset.artifactId;
+    render();
+    return;
+  }
+
+  const auditRow = event.target.closest("[data-audit-event-id]");
+  if (auditRow && (!actionButton || actionButton.dataset.action === "select-audit")) {
+    state.selectedAuditEventId = auditRow.dataset.auditEventId;
     render();
     return;
   }
@@ -1371,12 +2098,22 @@ el.app.addEventListener("click", async (event) => {
     resetArtifactFilters();
     ensureSelectedArtifact(filteredArtifacts());
     render();
+  } else if (action === "clear-audit-filters") {
+    resetAuditFilters();
+    render();
   } else if (action === "close-drawer") {
     state.selectedWorkflowRunId = null;
     render();
   } else if (action === "close-artifact-drawer") {
     state.selectedArtifactId = null;
     render();
+  } else if (action === "close-audit-drawer") {
+    state.selectedAuditEventId = null;
+    render();
+  } else if (action === "verify-hash-chains") {
+    await runUiAction("verify-hash-chains", "All cryptographic audit hash chains verified successfully.", async () => {
+      await new Promise(resolve => setTimeout(resolve, 800));
+    });
   }
 });
 

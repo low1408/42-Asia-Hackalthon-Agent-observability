@@ -4,9 +4,52 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAppServices } from "./services.js";
 import { createMemoryStore, createPostgresStore } from "./postgresStore.js";
+import { assertUserCan, httpError } from "./domain.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(__dirname, "../public");
+
+function checkAuthorization(req, services) {
+  const url = new URL(req.url, "http://localhost");
+  const method = req.method;
+  const segments = url.pathname.split("/").filter(Boolean);
+
+  if (!url.pathname.startsWith("/api/")) return;
+  if (url.pathname === "/api/webhooks/events") return;
+
+  const actor = services.actorFromUserId(req.headers["x-user-id"] || "usr_admin");
+
+  if (method === "POST") {
+    if (url.pathname === "/api/workflow-runs") {
+      assertUserCan(actor, "create_workflow_run");
+    } else if (segments[0] === "api" && segments[1] === "workflow-runs" && segments[3] === "agent-runs" && segments[4] === "simulate") {
+      assertUserCan(actor, "create_workflow_run");
+    } else if (segments[0] === "api" && segments[1] === "approval-requests" && (segments[3] === "approve" || segments[3] === "reject")) {
+      const action = segments[3];
+      assertUserCan(actor, action === "approve" ? "approve" : "reject");
+      
+      const approvalRequestId = segments[2];
+      const approvalRequest = services.store.approvalRequests.find((r) => r.id === approvalRequestId);
+      if (approvalRequest) {
+        const required = approvalRequest.requiredApprovers.some((approver) => approver.userId === actor.id);
+        const isAdmin = actor.roles.includes("admin");
+        if (!required && !isAdmin) {
+          throw httpError(403, "User is not a required approver for this request");
+        }
+      }
+    } else if (segments[0] === "api" && segments[1] === "tool-actions" && segments[3] === "execute") {
+      assertUserCan(actor, "execute_tool_action");
+    }
+  } else if (method === "PUT") {
+    if (segments[0] === "api" && segments[1] === "policy-rules" && segments.length === 3) {
+      assertUserCan(actor, "update_policy");
+    }
+  } else if (method === "GET") {
+    if (url.pathname === "/api/audit-events") {
+      assertUserCan(actor, "read_audit");
+    }
+  }
+}
 
 export async function createDefaultServices() {
   const store = process.env.DATABASE_URL ? await createPostgresStore() : createMemoryStore();
@@ -34,6 +77,12 @@ export function createServer({ services = createAppServices(createMemoryStore())
       "cache-control": "no-store"
     });
     res.end(body);
+  }
+
+  async function persistStore() {
+    if (typeof services.store?.persist === "function") {
+      await services.store.persist();
+    }
   }
 
   async function persistStore() {
@@ -76,6 +125,8 @@ export function createServer({ services = createAppServices(createMemoryStore())
   }
 
   async function routeApi(req, res) {
+    checkAuthorization(req, services);
+
     const url = new URL(req.url, "http://localhost");
     const method = req.method;
     const segments = url.pathname.split("/").filter(Boolean);
@@ -85,8 +136,14 @@ export function createServer({ services = createAppServices(createMemoryStore())
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/metrics") {
+      sendJson(res, 200, { metrics: services.dashboardMetrics() });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/workflow-runs") {
-      sendJson(res, 200, { workflowRuns: services.listWorkflowRuns() });
+      const since = url.searchParams.get("since") || undefined;
+      sendJson(res, 200, { workflowRuns: services.listWorkflowRuns(since) });
       return;
     }
 
@@ -120,11 +177,22 @@ export function createServer({ services = createAppServices(createMemoryStore())
       });
       await persistStore();
       sendJson(res, 200, payload);
+      const payload = services.updateAgentRunProgress({
+        agentRunId: segments[2],
+        progress: body.progress,
+        status: body.status,
+        waitingOn: body.waitingOn
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "agent-runs" && segments[3] === "complete") {
       const body = await parseJson(req);
+      const payload = services.completeAgentRun({ agentRunId: segments[2], autoSubmitProposal: body.autoSubmitProposal ?? false });
+      await persistStore();
+      sendJson(res, 200, payload);
       const payload = services.completeAgentRun({ agentRunId: segments[2], autoSubmitProposal: body.autoSubmitProposal ?? false });
       await persistStore();
       sendJson(res, 200, payload);
@@ -134,6 +202,9 @@ export function createServer({ services = createAppServices(createMemoryStore())
     if (method === "POST" && url.pathname === "/api/workflow-runs") {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
+      const payload = services.createWorkflowRun({ actor, source: body.source ?? "ui", title: body.title, request: body.request });
+      await persistStore();
+      sendJson(res, 201, payload);
       const payload = services.createWorkflowRun({ actor, source: body.source ?? "ui", title: body.title, request: body.request });
       await persistStore();
       sendJson(res, 201, payload);
@@ -149,6 +220,9 @@ export function createServer({ services = createAppServices(createMemoryStore())
       const payload = services.startAgentRunSimulation({ workflowRunId: segments[2] });
       await persistStore();
       sendJson(res, 202, payload);
+      const payload = services.startAgentRunSimulation({ workflowRunId: segments[2] });
+      await persistStore();
+      sendJson(res, 202, payload);
       return;
     }
 
@@ -160,6 +234,9 @@ export function createServer({ services = createAppServices(createMemoryStore())
 
     if (method === "GET" && segments[0] === "api" && segments[1] === "workflow-runs" && segments[3] === "audit-export") {
       const actor = userFromHeaders(req);
+      const payload = services.auditExport({ actor, workflowRunId: segments[2] });
+      await persistStore();
+      sendJson(res, 200, payload);
       const payload = services.auditExport({ actor, workflowRunId: segments[2] });
       await persistStore();
       sendJson(res, 200, payload);
@@ -182,12 +259,28 @@ export function createServer({ services = createAppServices(createMemoryStore())
       });
       await persistStore();
       sendJson(res, 201, payload);
+      const payload = services.submitAgentProposal({
+        agent,
+        workflowRunId: body.workflowRunId,
+        proposal: body.proposal
+      });
+      await persistStore();
+      sendJson(res, 201, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "approval-requests" && segments[3] === "approve") {
       const body = await parseJson(req);
       const actor = userFromHeaders(req);
+      const payload = services.applyApprovalDecision({
+        actor,
+        approvalRequestId: segments[2],
+        decision: "approved",
+        comment: body.comment,
+        overrideReason: body.overrideReason
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       const payload = services.applyApprovalDecision({
         actor,
         approvalRequestId: segments[2],
@@ -217,11 +310,23 @@ export function createServer({ services = createAppServices(createMemoryStore())
       });
       await persistStore();
       sendJson(res, 200, payload);
+      const payload = services.applyApprovalDecision({
+        actor,
+        approvalRequestId: segments[2],
+        decision: "rejected",
+        comment: body.comment,
+        overrideReason: body.overrideReason
+      });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && segments[0] === "api" && segments[1] === "tool-actions" && segments[3] === "execute") {
       const actor = userFromHeaders(req);
+      const payload = services.executeToolAction({ actor, toolActionProposalId: segments[2] });
+      await persistStore();
+      sendJson(res, 200, payload);
       const payload = services.executeToolAction({ actor, toolActionProposalId: segments[2] });
       await persistStore();
       sendJson(res, 200, payload);
@@ -234,12 +339,14 @@ export function createServer({ services = createAppServices(createMemoryStore())
     }
 
     if (method === "GET" && url.pathname === "/api/timeline") {
-      sendJson(res, 200, { timeline: services.listTimeline() });
+      const since = url.searchParams.get("since") || undefined;
+      sendJson(res, 200, { timeline: services.listTimeline(since) });
       return;
     }
 
     if (method === "GET" && url.pathname === "/api/policy-checks") {
-      sendJson(res, 200, { policyChecks: services.listPolicyChecks() });
+      const since = url.searchParams.get("since") || undefined;
+      sendJson(res, 200, { policyChecks: services.listPolicyChecks(since) });
       return;
     }
 
@@ -249,7 +356,8 @@ export function createServer({ services = createAppServices(createMemoryStore())
     }
 
     if (method === "GET" && url.pathname === "/api/artifacts") {
-      sendJson(res, 200, { artifacts: services.listArtifacts() });
+      const since = url.searchParams.get("since") || undefined;
+      sendJson(res, 200, { artifacts: services.listArtifacts(since) });
       return;
     }
 
@@ -259,11 +367,21 @@ export function createServer({ services = createAppServices(createMemoryStore())
       const payload = services.updatePolicyRule({ actor, ruleId: segments[2], patch: body });
       await persistStore();
       sendJson(res, 200, payload);
+      const payload = services.updatePolicyRule({ actor, ruleId: segments[2], patch: body });
+      await persistStore();
+      sendJson(res, 200, payload);
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/webhooks/events") {
       const body = await parseJson(req);
+      const payload = services.receiveWebhookEvent({
+        source: body.source ?? "webhook",
+        eventType: body.eventType,
+        payload: body.payload ?? {}
+      });
+      await persistStore();
+      sendJson(res, 202, payload);
       const payload = services.receiveWebhookEvent({
         source: body.source ?? "webhook",
         eventType: body.eventType,
@@ -295,6 +413,10 @@ export function createServer({ services = createAppServices(createMemoryStore())
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT ?? 3010);
+  const services = await createDefaultServices();
+  createServer({ services }).listen(port, () => {
+    const storage = services.store.storage?.type ?? "memory";
+    console.log(`Enterprise Agent-Human Collaboration Layer listening on http://localhost:${port} using ${storage} storage`);
   const services = await createDefaultServices();
   createServer({ services }).listen(port, () => {
     const storage = services.store.storage?.type ?? "memory";
