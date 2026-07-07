@@ -7,7 +7,11 @@ const state = {
   selectedTab: "overview",
   selectedArtifactId: null,
   selectedArtifactTab: "overview",
+  loadingAction: null,
+  flashMessage: "",
+  errorMessage: "",
   filters: {
+    search: "",
     status: "all",
     agent: "all",
     risk: "all",
@@ -15,7 +19,9 @@ const state = {
     department: "all",
     duration: "any",
     humanAction: "all",
-    sla: "all"
+    sla: "all",
+    sortKey: "lastUpdated",
+    sortDirection: "desc"
   },
   artifactFilters: {
     search: "",
@@ -27,7 +33,9 @@ const state = {
     department: "all",
     date: "any",
     needsReview: "all",
-    sla: "all"
+    sla: "all",
+    sortKey: "updated",
+    sortDirection: "desc"
   }
 };
 
@@ -79,6 +87,66 @@ function users() {
 
 function currentActor() {
   return users().find((user) => user.id === state.actorId);
+}
+
+function actorHasRole(role) {
+  return Boolean(currentActor()?.roles?.includes(role));
+}
+
+function canReadAudit() {
+  return ["auditor", "operator", "admin"].some(actorHasRole);
+}
+
+function canExecuteTools() {
+  return ["operator", "admin"].some(actorHasRole);
+}
+
+function canUpdatePolicy() {
+  return actorHasRole("admin");
+}
+
+function canDecideApproval(approval) {
+  const actor = currentActor();
+  if (!actor || approval?.status !== "pending") return false;
+  const requiredUserIds = approval.requiredApprovers?.map((approver) => approver.userId) || [];
+  return requiredUserIds.includes(actor.id) || actor.roles.includes("admin");
+}
+
+function renderFeedback() {
+  if (!state.flashMessage && !state.errorMessage) return "";
+  return (
+    '<section class="feedback-stack" aria-live="polite">' +
+    (state.flashMessage ? '<div class="feedback success">✓ ' + escapeHtml(state.flashMessage) + "</div>" : "") +
+    (state.errorMessage ? '<div class="feedback error">⚠ ' + escapeHtml(state.errorMessage) + "</div>" : "") +
+    "</section>"
+  );
+}
+
+function actionAttrs(action, key, extra = "") {
+  const busy = state.loadingAction === key;
+  return ' data-action="' + escapeHtml(action) + '" data-action-key="' + escapeHtml(key) + '"' + (busy ? ' disabled aria-busy="true"' : "") + (extra ? " " + extra : "");
+}
+
+function comingSoonButton(label, className = "") {
+  return '<button class="' + escapeHtml(className) + '" disabled aria-disabled="true" title="Coming soon in a future backend-backed workflow">' + escapeHtml(label) + "</button>";
+}
+
+async function runUiAction(key, successMessage, callback) {
+  if (state.loadingAction) return;
+  state.loadingAction = key;
+  state.flashMessage = "";
+  state.errorMessage = "";
+  render();
+  try {
+    const result = await callback();
+    state.flashMessage = successMessage;
+    return result;
+  } catch (error) {
+    state.errorMessage = error.message || "Action failed";
+  } finally {
+    state.loadingAction = null;
+    render();
+  }
 }
 
 function escapeHtml(value) {
@@ -195,13 +263,36 @@ function enrichedRuns() {
       progress: Number(agentRun?.progress ?? 0),
       waitingOn: approvals[0]?.requiredApprovers?.[0]?.userId ? findUser(approvals[0].requiredApprovers[0].userId)?.name : agentRun?.waitingOn,
       duration: durationFrom(agentRun?.startedAt || run.createdAt, agentRun?.completedAt),
+      durationMinutes: durationMinutes({ run, agentRun }),
+      lastUpdatedAt: event?.occurredAt || agentRun?.completedAt || agentRun?.startedAt || run.updatedAt || run.createdAt,
       department: run.request?.department || owner?.department || "Unknown"
     };
   });
 }
 
 function filteredRuns() {
-  return enrichedRuns().filter((item) => {
+  const filters = state.filters;
+  const rows = enrichedRuns().filter((item) => {
+    const search = filters.search.trim().toLowerCase();
+    if (search) {
+      const haystack = [
+        item.run.title,
+        item.agentRun?.role,
+        item.run.type,
+        item.agentRun?.agentName,
+        item.owner?.name,
+        item.status,
+        item.run.status,
+        item.risk,
+        item.waitingOn,
+        item.department,
+        item.latestEvent?.action,
+        item.latestEvent?.summary
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
     if (state.filters.status !== "all" && item.status !== state.filters.status && item.run.status !== state.filters.status) return false;
     if (state.filters.agent !== "all" && item.agentRun?.agentId !== state.filters.agent) return false;
     if (state.filters.risk !== "all" && item.risk !== state.filters.risk) return false;
@@ -214,6 +305,24 @@ function filteredRuns() {
     if (state.filters.duration === "under10" && durationMinutes(item) >= 10) return false;
     if (state.filters.duration === "over10" && durationMinutes(item) <= 10) return false;
     return true;
+  });
+  return sortRuns(rows);
+}
+
+function sortRuns(rows) {
+  const direction = state.filters.sortDirection === "asc" ? 1 : -1;
+  const valueFor = (item) => {
+    if (state.filters.sortKey === "duration") return item.durationMinutes;
+    if (state.filters.sortKey === "status") return item.status;
+    if (state.filters.sortKey === "risk") return item.risk;
+    if (state.filters.sortKey === "progress") return item.progress;
+    return new Date(item.lastUpdatedAt || 0).getTime();
+  };
+  return [...rows].sort((a, b) => {
+    const av = valueFor(a);
+    const bv = valueFor(b);
+    if (typeof av === "number" && typeof bv === "number") return (av - bv) * direction;
+    return String(av).localeCompare(String(bv)) * direction;
   });
 }
 
@@ -255,7 +364,7 @@ function enrichedArtifacts() {
 
 function filteredArtifacts() {
   const filters = state.artifactFilters;
-  return enrichedArtifacts().filter((artifact) => {
+  const rows = enrichedArtifacts().filter((artifact) => {
     const search = filters.search.trim().toLowerCase();
     if (search) {
       const haystack = [artifact.name, artifact.type, artifact.owner, artifact.linkedWorkItemTitle, artifact.department, artifact.classificationLabel, artifact.accessLabel, artifact.policyStatusLabel].join(" ").toLowerCase();
@@ -278,6 +387,24 @@ function filteredArtifacts() {
       if (filters.date === "month" && ageHours > 24 * 30) return false;
     }
     return true;
+  });
+  return sortArtifacts(rows);
+}
+
+function sortArtifacts(rows) {
+  const direction = state.artifactFilters.sortDirection === "asc" ? 1 : -1;
+  const valueFor = (artifact) => {
+    if (state.artifactFilters.sortKey === "name") return artifact.name;
+    if (state.artifactFilters.sortKey === "policyStatus") return artifact.policyStatusLabel || artifact.policyStatus;
+    if (state.artifactFilters.sortKey === "classification") return artifact.classificationLabel || artifact.classification;
+    if (state.artifactFilters.sortKey === "owner") return artifact.owner;
+    return new Date(artifact.updatedAt || artifact.createdAt || 0).getTime();
+  };
+  return [...rows].sort((a, b) => {
+    const av = valueFor(a);
+    const bv = valueFor(b);
+    if (typeof av === "number" && typeof bv === "number") return (av - bv) * direction;
+    return String(av).localeCompare(String(bv)) * direction;
   });
 }
 
@@ -334,9 +461,10 @@ function renderHomePage() {
   el.app.innerHTML =
     '<section class="utility-row">' +
     "<div></div>" +
-    '<label class="date-filter">📅<select><option>Last 24 hours</option><option>Last 7 days</option><option>Last 30 days</option></select></label>' +
-    '<button class="icon-button" data-action="refresh">↻</button>' +
+    '<label class="date-filter" title="Date range filtering is not available in the in-memory demo data">📅<select disabled aria-disabled="true"><option>Demo data range</option></select></label>' +
+    '<button class="icon-button"' + actionAttrs("refresh", "refresh") + ">↻</button>" +
     "</section>" +
+    renderFeedback() +
     '<section class="metric-grid" aria-label="Metrics">' + renderHomeMetrics() + "</section>" +
     '<section class="dashboard-grid">' +
     renderWorkboardPanel(focus === "workboard") +
@@ -403,6 +531,7 @@ function renderCompactAgentRunsPanel() {
 }
 
 function renderCompactAgentRun(run) {
+  const actionKey = "simulate:" + run.id;
   return (
     '<div class="agent-run" data-agent-run-id="' + escapeHtml(run.id) + '">' +
     '<div class="run-avatar">' + escapeHtml(run.agentName.slice(0, 2).toUpperCase()) + "</div>" +
@@ -411,7 +540,7 @@ function renderCompactAgentRun(run) {
     '<div class="progress-row"><div class="progress"><span style="width: ' + Number(run.progress) + '%"></span></div><small>' + Number(run.progress) + "%</small></div>" +
     (run.waitingOn ? '<small class="muted">Waiting on: ' + escapeHtml(run.waitingOn) + "</small>" : "") +
     "</div>" +
-    '<button class="simulate-button" data-action="simulate" ' + (run.status === "completed" ? "disabled" : "") + ">Sim</button>" +
+    '<button class="simulate-button"' + actionAttrs("simulate", actionKey, run.status === "completed" ? 'disabled title="Completed runs cannot be simulated again"' : "") + ">" + (state.loadingAction === actionKey ? "..." : "Sim") + "</button>" +
     "</div>"
   );
 }
@@ -433,13 +562,34 @@ function renderPolicyPanel(focused) {
   return (
     '<article id="policyAudit" class="panel span-4' + (focused ? " focus-panel" : "") + '">' +
     '<div class="panel-heading"><h2>Policy & Audit</h2><a href="#policyAudit">View all</a></div>' +
-    '<div class="tabs"><button class="active">Policy Checks</button><button>Audit Log</button></div>' +
+    '<div class="tabs"><button class="active" disabled aria-disabled="true" title="Current panel view">Policy Checks</button><button disabled aria-disabled="true" title="Use run trace or artifact audit drawers for audit details">Audit Log</button></div>' +
     '<div class="policy-summary"><div><span>All Checks</span><strong>' + summary.allChecks + "</strong></div><div><span>Allowed</span><strong>" + summary.allowed + "</strong></div><div><span>Blocked</span><strong>" + summary.blocked + "</strong></div><div><span>Alerts</span><strong>" + summary.alerts + "</strong></div></div>" +
     '<div class="policy-checks">' +
     dashboard()
       .policyAudit.checks.map((check) => '<div class="policy-row"><span>▧ ' + escapeHtml(check.summary) + '</span><strong class="' + escapeHtml(check.result) + '">' + escapeHtml(titleCase(check.result)) + "</strong><small>" + escapeHtml(check.ago || "") + "</small></div>")
       .join("") +
-    '</div><a class="panel-footer-link" href="#policyAudit">View all policy checks</a></article>'
+    '</div>' +
+    renderPolicyRules() +
+    '<a class="panel-footer-link" href="#policyAudit">View all policy checks</a></article>'
+  );
+}
+
+function renderPolicyRules() {
+  const rules = state.bootstrap.policyRules || [];
+  if (!rules.length) return "";
+  return (
+    '<div class="policy-rules"><h3>Policy Rules</h3>' +
+    rules
+      .map((rule) => {
+        const key = "policy:" + rule.id;
+        const stateLabel = rule.enabled ? "Enabled" : "Disabled";
+        const toggle = canUpdatePolicy()
+          ? '<button class="policy-toggle"' + actionAttrs("toggle-policy-rule", key, 'data-policy-rule-id="' + escapeHtml(rule.id) + '"') + ">" + (state.loadingAction === key ? "Saving..." : rule.enabled ? "Disable" : "Enable") + "</button>"
+          : "";
+        return '<div class="policy-rule-row"><div><strong>' + escapeHtml(rule.name) + '</strong><p>' + escapeHtml(rule.reason || "Policy rule") + '</p></div>' + smallBadge(stateLabel, rule.enabled ? "allowed" : "muted-badge") + toggle + "</div>";
+      })
+      .join("") +
+    "</div>"
   );
 }
 
@@ -478,8 +628,9 @@ function renderArtifactsPage() {
   el.app.innerHTML =
     '<section class="page-header artifact-page-header">' +
     '<div><h1>Artifacts</h1><p>Browse enterprise outputs, documents, reports, and generated assets with policy-aware access and full audit history.</p></div>' +
-    '<div class="page-actions"><button class="primary-button">＋ Upload Artifact</button><button>▱ Create Folder</button><button>⇩ Export</button></div>' +
+    '<div class="page-actions">' + comingSoonButton("＋ Upload Artifact", "primary-button") + comingSoonButton("▱ Create Folder") + comingSoonButton("⇩ Export") + "</div>" +
     "</section>" +
+    renderFeedback() +
     '<section class="artifact-metric-grid">' + renderArtifactMetrics() + "</section>" +
     '<section class="artifacts-workspace">' +
     '<div class="artifacts-main">' + renderArtifactFilters() + renderArtifactTable(rows) + renderArtifactHealth() + "</div>" +
@@ -532,7 +683,9 @@ function renderArtifactFilters() {
     '<label>Date<select data-artifact-filter="date"><option value="any">Any</option><option value="today"' + (filters.date === "today" ? " selected" : "") + '>Last 24h</option><option value="week"' + (filters.date === "week" ? " selected" : "") + '>Last 7d</option><option value="month"' + (filters.date === "month" ? " selected" : "") + ">Last 30d</option></select></label>" +
     '<label>Needs Review<select data-artifact-filter="needsReview"><option value="all">All</option><option value="yes"' + (filters.needsReview === "yes" ? " selected" : "") + '>Yes</option><option value="no"' + (filters.needsReview === "no" ? " selected" : "") + ">No</option></select></label>" +
     '<label>SLA<select data-artifact-filter="sla"><option value="all">All</option><option value="healthy"' + (filters.sla === "healthy" ? " selected" : "") + '>Healthy</option><option value="breached"' + (filters.sla === "breached" ? " selected" : "") + ">Breached</option></select></label>" +
-    '<button data-action="clear-artifact-filters">Clear</button><button>Sort: Last updated⌃</button>' +
+    '<label>Sort<select data-artifact-filter="sortKey"><option value="updated"' + (filters.sortKey === "updated" ? " selected" : "") + '>Last updated</option><option value="name"' + (filters.sortKey === "name" ? " selected" : "") + '>Name</option><option value="policyStatus"' + (filters.sortKey === "policyStatus" ? " selected" : "") + '>Policy status</option><option value="classification"' + (filters.sortKey === "classification" ? " selected" : "") + '>Classification</option><option value="owner"' + (filters.sortKey === "owner" ? " selected" : "") + ">Owner</option></select></label>" +
+    '<label>Order<select data-artifact-filter="sortDirection"><option value="desc"' + (filters.sortDirection === "desc" ? " selected" : "") + '>Desc</option><option value="asc"' + (filters.sortDirection === "asc" ? " selected" : "") + ">Asc</option></select></label>" +
+    '<button' + actionAttrs("clear-artifact-filters", "clear-artifact-filters") + ">Clear</button>" +
     "</div>"
   );
 }
@@ -631,7 +784,7 @@ function renderArtifactAccessPolicy(artifact) {
     "<div><dt>Retention Policy</dt><dd>" + escapeHtml(artifact.retentionPolicy || "7 years") + "</dd></div>" +
     "<div><dt>Policy Classification</dt><dd>" + artifactBadge(artifact.policyClassification || artifact.classificationLabel, "classification", artifact.classification) + "</dd></div>" +
     "</dl>" +
-    '<div class="artifact-actions"><button class="primary-button">🔗 Request Access</button><button disabled>⌘ Share</button><button disabled>⇩ Download</button><button>◉ View Audit</button></div>' +
+    '<div class="artifact-actions">' + comingSoonButton("🔗 Request Access", "primary-button") + comingSoonButton("⌘ Share") + comingSoonButton("⇩ Download") + '<button data-action="view-artifact-audit">◉ View Audit</button></div>' +
     "</section>"
   );
 }
@@ -724,8 +877,9 @@ function renderAgentRunsPage() {
   el.app.innerHTML =
     '<section class="page-header">' +
     '<div><h1>Agent Runs</h1><p>Monitor live agent execution, blockers, approvals, and risk across the enterprise.</p></div>' +
-    '<div class="page-actions"><button class="primary-button">＋ Create Run</button><button data-action="refresh">⇩ Export</button><button>··· More</button></div>' +
+    '<div class="page-actions"><button class="primary-button" data-action="create-run">＋ Create Run</button>' + (canReadAudit() ? '<button' + actionAttrs("export-audit", "export-audit") + '>⇩ Export</button>' : "") + comingSoonButton("··· More") + "</div>" +
     "</section>" +
+    renderFeedback() +
     '<section class="run-metric-grid">' + renderRunMetrics() + "</section>" +
     '<section class="agent-runs-workspace">' +
     '<div class="runs-main">' + renderRunFilters() + renderRunTable(rows) + renderRunHealth() + "</div>" +
@@ -764,7 +918,7 @@ function renderRunFilters() {
   const departments = [...new Set(runs.map((item) => item.department))].map((department) => ({ value: department, label: department }));
   return (
     '<div class="run-filters">' +
-    '<div class="search run-search">⌕ <span>Search runs, work items, agents, owners...</span></div>' +
+    '<input class="run-search" data-run-search type="search" placeholder="Search runs, work items, agents, owners..." value="' + escapeHtml(state.filters.search) + '" />' +
     '<label>Status<select data-filter="status">' + selectOptions(statuses, state.filters.status, "All") + "</select></label>" +
     '<label>Agent<select data-filter="agent">' + selectOptions(agents, state.filters.agent, "All") + "</select></label>" +
     '<label>Risk<select data-filter="risk">' + selectOptions(risks, state.filters.risk, "All") + "</select></label>" +
@@ -773,7 +927,9 @@ function renderRunFilters() {
     '<label>Duration<select data-filter="duration"><option value="any">Any</option><option value="under10"' + (state.filters.duration === "under10" ? " selected" : "") + '>Under 10m</option><option value="over10"' + (state.filters.duration === "over10" ? " selected" : "") + ">Over 10m</option></select></label>" +
     '<label>Needs Human Action<select data-filter="humanAction"><option value="all">All</option><option value="yes"' + (state.filters.humanAction === "yes" ? " selected" : "") + '>Yes</option><option value="no"' + (state.filters.humanAction === "no" ? " selected" : "") + ">No</option></select></label>" +
     '<label>SLA Breached<select data-filter="sla"><option value="all">All</option><option value="breached"' + (state.filters.sla === "breached" ? " selected" : "") + '>Breached</option><option value="healthy"' + (state.filters.sla === "healthy" ? " selected" : "") + ">Healthy</option></select></label>" +
-    '<button data-action="clear-filters">Filters</button><button>Sort: Last updated⌃</button>' +
+    '<label>Sort<select data-filter="sortKey"><option value="lastUpdated"' + (state.filters.sortKey === "lastUpdated" ? " selected" : "") + '>Last updated</option><option value="duration"' + (state.filters.sortKey === "duration" ? " selected" : "") + '>Duration</option><option value="status"' + (state.filters.sortKey === "status" ? " selected" : "") + '>Status</option><option value="risk"' + (state.filters.sortKey === "risk" ? " selected" : "") + '>Risk</option><option value="progress"' + (state.filters.sortKey === "progress" ? " selected" : "") + ">Progress</option></select></label>" +
+    '<label>Order<select data-filter="sortDirection"><option value="desc"' + (state.filters.sortDirection === "desc" ? " selected" : "") + '>Desc</option><option value="asc"' + (state.filters.sortDirection === "asc" ? " selected" : "") + ">Asc</option></select></label>" +
+    '<button' + actionAttrs("clear-filters", "clear-filters") + ">Clear</button>" +
     "</div>"
   );
 }
@@ -836,9 +992,10 @@ function renderRunDrawer() {
   const item = selectedRunItem();
   if (!item) return '<aside class="run-detail-drawer panel"><p class="muted">No run selected.</p></aside>';
   const run = item.run;
+  const auditButton = canReadAudit() ? '<button class="drawer-audit-button" data-action="view-run-audit">View Audit</button>' : "";
   return (
     '<aside class="run-detail-drawer panel">' +
-    '<div class="drawer-heading"><div><span class="live-dot">●</span><h2>' + escapeHtml(run.title) + '</h2><div class="drawer-badges">' + statusBadge(item.status) + riskBadge(item.risk) + '</div></div><button data-action="close-drawer">×</button></div>' +
+    '<div class="drawer-heading"><div><span class="live-dot">●</span><h2>' + escapeHtml(run.title) + '</h2><div class="drawer-badges">' + statusBadge(item.status) + riskBadge(item.risk) + '</div></div><div class="drawer-actions">' + auditButton + '<button data-action="close-drawer">×</button></div></div>' +
     renderRunFacts(item) +
     renderCurrentRequest(item) +
     renderDetailTabs() +
@@ -863,12 +1020,16 @@ function renderCurrentRequest(item) {
   const approval = item.approvals[0];
   if (!approval) return "";
   const approver = findUser(approval.requiredApprovers?.[0]?.userId);
+  const actionKey = "approval:" + approval.id;
+  const actions = canDecideApproval(approval)
+    ? '<button class="approve-button"' + actionAttrs("approve", actionKey + ":approve", 'data-approval-id="' + escapeHtml(approval.id) + '"') + '>✓ Approve</button><button class="reject-button"' + actionAttrs("reject", actionKey + ":reject", 'data-approval-id="' + escapeHtml(approval.id) + '"') + ">⊗ Reject</button>"
+    : '<p class="empty-copy">Only required approvers or admins can decide this request.</p>';
   return (
     '<section class="current-request">' +
     "<h3>ⓘ Current Request</h3>" +
     "<p>Approve " + escapeHtml(item.run.title.toLowerCase()) + " for governed execution.</p>" +
     "<small>Reason</small><strong>" + escapeHtml(approval.policyResult?.summary || approval.requiredApprovers?.[0]?.reason || "Policy requires human approval.") + "</strong>" +
-    '<div class="approval-actions"><button class="approve-button" data-action="approve" data-approval-id="' + escapeHtml(approval.id) + '">✓ Approve</button><button class="reject-button" data-action="reject" data-approval-id="' + escapeHtml(approval.id) + '">⊗ Reject</button><button>✎ Request Changes</button><button>↗ Escalate</button></div>' +
+    '<div class="approval-actions">' + actions + comingSoonButton("✎ Request Changes") + comingSoonButton("↗ Escalate") + "</div>" +
     '<div class="request-meta"><div><span>Required Authority</span><strong>' + escapeHtml(approval.requiredApprovers?.[0]?.role || "Approver") + '</strong></div><div><span>Due</span><strong class="negative">In ' + escapeHtml(dueIn(approval.dueAt)) + '</strong></div><div><span>Waiting On</span><strong>' + escapeHtml(approver?.name || item.waitingOn || "Approver") + "</strong></div></div>" +
     "</section>"
   );
@@ -936,7 +1097,19 @@ function renderTimelineItem(event) {
 function renderToolsTab(run) {
   const proposals = run.toolActionProposals || [];
   if (!proposals.length) return '<p class="empty-copy">No tool proposals yet.</p>';
-  return proposals.map((proposal) => '<div class="detail-row"><div><strong>' + escapeHtml(titleCase(proposal.actionType)) + '</strong><p>' + escapeHtml(proposal.summary) + '</p></div>' + statusBadge(proposal.status) + '</div>').join("");
+  return proposals
+    .map((proposal) => {
+      const actionKey = "execute:" + proposal.id;
+      const result = proposal.executionResult
+        ? '<p class="execution-result">Purchase request: <strong>' + escapeHtml(proposal.executionResult.purchaseRequestRef || "—") + '</strong> · Ticket: <strong>' + escapeHtml(proposal.executionResult.ticketRef || "—") + "</strong></p>"
+        : "";
+      const executeButton = proposal.status === "approved" && canExecuteTools()
+        ? '<button class="primary-button"' + actionAttrs("execute-tool", actionKey, 'data-tool-action-id="' + escapeHtml(proposal.id) + '"') + ">" + (state.loadingAction === actionKey ? "Executing..." : "Execute") + "</button>"
+        : "";
+      const helper = proposal.status === "approved" && !canExecuteTools() ? '<small class="muted">Switch to Omar Operator or Asha Admin to execute this action.</small>' : "";
+      return '<div class="detail-row"><div><strong>' + escapeHtml(titleCase(proposal.actionType)) + '</strong><p>' + escapeHtml(proposal.summary) + '</p>' + result + helper + '</div><div class="detail-actions">' + statusBadge(proposal.status) + executeButton + "</div></div>";
+    })
+    .join("");
 }
 
 function renderApprovalsTab(run) {
@@ -945,9 +1118,10 @@ function renderApprovalsTab(run) {
   return approvals
     .map((approval) => {
       const pending = approval.status === "pending";
+      const actionKey = "approval:" + approval.id;
       return (
         '<div class="detail-row" data-approval-id="' + escapeHtml(approval.id) + '"><div><strong>' + escapeHtml(titleCase(approval.status)) + ' approval</strong><p>' + escapeHtml(approval.requiredApprovers?.map((approver) => approver.reason).join(", ") || "Required approval") + '</p><small>Due ' + escapeHtml(dueIn(approval.dueAt)) + "</small></div>" +
-        (pending ? '<div class="approval-actions compact"><button class="approve-button" data-action="approve" data-approval-id="' + escapeHtml(approval.id) + '">Approve</button><button class="reject-button" data-action="reject" data-approval-id="' + escapeHtml(approval.id) + '">Reject</button></div>' : statusBadge(approval.status)) +
+        (pending && canDecideApproval(approval) ? '<div class="approval-actions compact"><button class="approve-button"' + actionAttrs("approve", actionKey + ":approve", 'data-approval-id="' + escapeHtml(approval.id) + '"') + '>Approve</button><button class="reject-button"' + actionAttrs("reject", actionKey + ":reject", 'data-approval-id="' + escapeHtml(approval.id) + '"') + ">Reject</button></div>" : pending ? '<small class="muted">Required approver/admin only</small>' : statusBadge(approval.status)) +
         "</div>"
       );
     })
@@ -995,6 +1169,92 @@ async function decideApproval(approvalId, action) {
   await load();
 }
 
+async function executeToolAction(toolActionId) {
+  const updatedRun = await api("/api/tool-actions/" + toolActionId + "/execute", { method: "POST" });
+  state.selectedWorkflowRunId = updatedRun.id;
+  state.selectedTab = "tools";
+  await load();
+}
+
+async function togglePolicyRule(ruleId) {
+  const rule = (state.bootstrap.policyRules || []).find((entry) => entry.id === ruleId);
+  if (!rule) throw new Error("Policy rule not found");
+  await api("/api/policy-rules/" + ruleId, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: !rule.enabled })
+  });
+  await load();
+}
+
+async function exportSelectedAudit() {
+  const item = selectedRunItem() || enrichedRuns()[0];
+  if (!item) throw new Error("No workflow run selected for audit export");
+  const auditPacket = await api("/api/workflow-runs/" + item.run.id + "/audit-export");
+  downloadJson("audit-export-" + item.run.id + ".json", auditPacket);
+}
+
+function downloadJson(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function focusIntakeForm() {
+  location.hash = "#settings";
+  state.currentRoute = "settings";
+  render();
+  requestAnimationFrame(() => document.querySelector("#requestForm input")?.focus());
+}
+
+function resetRunFilters() {
+  state.filters = {
+    search: "",
+    status: "all",
+    agent: "all",
+    risk: "all",
+    owner: "all",
+    department: "all",
+    duration: "any",
+    humanAction: "all",
+    sla: "all",
+    sortKey: "lastUpdated",
+    sortDirection: "desc"
+  };
+}
+
+function resetArtifactFilters() {
+  state.artifactFilters = {
+    search: "",
+    type: "all",
+    classification: "all",
+    owner: "all",
+    access: "all",
+    policyStatus: "all",
+    department: "all",
+    date: "any",
+    needsReview: "all",
+    sla: "all",
+    sortKey: "updated",
+    sortDirection: "desc"
+  };
+}
+
+function renderAndRestoreInput(selector, start, end) {
+  render();
+  const input = document.querySelector(selector);
+  if (!input) return;
+  input.focus();
+  if (typeof input.setSelectionRange === "function") {
+    input.setSelectionRange(start ?? input.value.length, end ?? input.value.length);
+  }
+}
+
 function configurePolling() {
   const hasActiveRuns = dashboard().agentRuns.some((run) => run.status !== "completed");
   if (hasActiveRuns && !state.pollTimer) {
@@ -1017,14 +1277,6 @@ window.addEventListener("hashchange", () => {
 });
 
 el.app.addEventListener("change", (event) => {
-  const artifactSearch = event.target.closest("[data-artifact-search]");
-  if (artifactSearch) {
-    state.artifactFilters.search = artifactSearch.value;
-    ensureSelectedArtifact(filteredArtifacts());
-    render();
-    return;
-  }
-
   const artifactFilter = event.target.closest("[data-artifact-filter]");
   if (artifactFilter) {
     state.artifactFilters[artifactFilter.dataset.artifactFilter] = artifactFilter.value;
@@ -1037,6 +1289,26 @@ el.app.addEventListener("change", (event) => {
   if (!filter) return;
   state.filters[filter.dataset.filter] = filter.value;
   render();
+});
+
+el.app.addEventListener("input", (event) => {
+  const artifactSearch = event.target.closest("[data-artifact-search]");
+  if (artifactSearch) {
+    const start = artifactSearch.selectionStart;
+    const end = artifactSearch.selectionEnd;
+    state.artifactFilters.search = artifactSearch.value;
+    ensureSelectedArtifact(filteredArtifacts());
+    renderAndRestoreInput("[data-artifact-search]", start, end);
+    return;
+  }
+
+  const runSearch = event.target.closest("[data-run-search]");
+  if (runSearch) {
+    const start = runSearch.selectionStart;
+    const end = runSearch.selectionEnd;
+    state.filters.search = runSearch.value;
+    renderAndRestoreInput("[data-run-search]", start, end);
+  }
 });
 
 el.app.addEventListener("click", async (event) => {
@@ -1072,17 +1344,31 @@ el.app.addEventListener("click", async (event) => {
   if (!actionButton) return;
   const action = actionButton.dataset.action;
   if (action === "refresh") {
-    await load();
+    await runUiAction("refresh", "Dashboard refreshed.", load);
   } else if (action === "simulate") {
     const agentRun = actionButton.closest("[data-agent-run-id]");
-    if (agentRun) await simulateAgentRun(agentRun.dataset.agentRunId);
+    if (agentRun) await runUiAction("simulate:" + agentRun.dataset.agentRunId, "Agent run simulation advanced.", () => simulateAgentRun(agentRun.dataset.agentRunId));
   } else if (action === "approve" || action === "reject") {
-    await decideApproval(actionButton.dataset.approvalId, action);
+    await runUiAction("approval:" + actionButton.dataset.approvalId + ":" + action, titleCase(action) + " decision recorded.", () => decideApproval(actionButton.dataset.approvalId, action));
+  } else if (action === "execute-tool") {
+    await runUiAction("execute:" + actionButton.dataset.toolActionId, "Tool action executed.", () => executeToolAction(actionButton.dataset.toolActionId));
+  } else if (action === "toggle-policy-rule") {
+    await runUiAction("policy:" + actionButton.dataset.policyRuleId, "Policy rule updated.", () => togglePolicyRule(actionButton.dataset.policyRuleId));
+  } else if (action === "export-audit") {
+    await runUiAction("export-audit", "Audit export downloaded.", exportSelectedAudit);
+  } else if (action === "create-run") {
+    focusIntakeForm();
+  } else if (action === "view-artifact-audit") {
+    state.selectedArtifactTab = "audit";
+    render();
+  } else if (action === "view-run-audit") {
+    state.selectedTab = "trace";
+    render();
   } else if (action === "clear-filters") {
-    state.filters = { status: "all", agent: "all", risk: "all", owner: "all", department: "all", duration: "any", humanAction: "all", sla: "all" };
+    resetRunFilters();
     render();
   } else if (action === "clear-artifact-filters") {
-    state.artifactFilters = { search: "", type: "all", classification: "all", owner: "all", access: "all", policyStatus: "all", department: "all", date: "any", needsReview: "all", sla: "all" };
+    resetArtifactFilters();
     ensureSelectedArtifact(filteredArtifacts());
     render();
   } else if (action === "close-drawer") {
@@ -1102,19 +1388,21 @@ el.app.addEventListener("submit", async (event) => {
   request.amount = Number(request.amount);
   request.currency = "USD";
   request.businessJustification = "Created from Agent Enterprise dashboard for " + request.department + ".";
-  const run = await api("/api/workflow-runs", {
-    method: "POST",
-    body: JSON.stringify({
-      source: "ui",
-      title: "Procurement request for " + request.vendor,
-      request
-    })
+  await runUiAction("create-run-submit", "Procurement work item created.", async () => {
+    const run = await api("/api/workflow-runs", {
+      method: "POST",
+      body: JSON.stringify({
+        source: "ui",
+        title: "Procurement request for " + request.vendor,
+        request
+      })
+    });
+    state.selectedWorkflowRunId = run.id;
+    await api("/api/workflow-runs/" + run.id + "/agent-runs/simulate", { method: "POST" });
+    location.hash = "#agentRuns";
+    state.currentRoute = "agentRuns";
+    await load();
   });
-  state.selectedWorkflowRunId = run.id;
-  await api("/api/workflow-runs/" + run.id + "/agent-runs/simulate", { method: "POST" });
-  location.hash = "#agentRuns";
-  state.currentRoute = "agentRuns";
-  await load();
 });
 
 load().catch((error) => {
