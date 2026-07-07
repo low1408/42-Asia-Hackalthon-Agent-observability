@@ -12,6 +12,9 @@ const state = {
   errorMessage: "",
   pollErrorCount: 0,
   lastLoadedAt: null,
+  cursor: null,
+  health: null,
+  auditVerification: null,
   auditEvents: [],
   auditFilters: {
     search: "",
@@ -101,6 +104,10 @@ function updateSystemStatus() {
   if (state.pollErrorCount > 0) {
     el.systemStatus.className = "system-status offline";
     el.systemStatus.innerHTML = '<span class="status-indicator-dot red-dot" style="display:inline-block;width:9px;height:9px;border-radius:999px;background:#f04438;margin-right:8px;"></span> Connection offline (' + state.pollErrorCount + ' failures)';
+  } else if (state.health && state.health.status !== "healthy") {
+    el.systemStatus.className = "system-status degraded";
+    const auditStatus = state.health.audit?.valid === false ? "audit chain degraded" : "backend degraded";
+    el.systemStatus.innerHTML = '<span class="status-indicator-dot amber-dot" style="display:inline-block;width:9px;height:9px;border-radius:999px;background:#f79009;margin-right:8px;"></span> Degraded: ' + escapeHtml(auditStatus);
   } else {
     el.systemStatus.className = "system-status online";
     const timeStr = state.lastLoadedAt ? ' (Updated ' + formatClock(state.lastLoadedAt) + ')' : '';
@@ -128,16 +135,32 @@ function renderInitialLoadError(error) {
   });
 }
 
+async function ensureAuditEventsLoaded(force = false) {
+  if (!canReadAudit()) {
+    state.auditEvents = [];
+    state.auditVerification = null;
+    state.errorMessage = "Current user is not authorized to read audit events.";
+    return;
+  }
+  if (!force && state.auditEvents.length) return;
+  const res = await api("/api/audit-events");
+  state.auditEvents = res.auditEvents || [];
+  state.errorMessage = "";
+}
+
 async function load() {
   try {
-    state.bootstrap = await api("/api/bootstrap");
+    const snapshot = await api("/api/observability/snapshot");
+    if (!snapshot) throw new Error("Dashboard snapshot response was empty");
+    state.bootstrap = snapshot;
     state.pollErrorCount = 0;
-    state.lastLoadedAt = new Date().toISOString();
+    state.cursor = state.bootstrap.cursor || new Date().toISOString();
+    state.health = state.bootstrap.health || null;
+    state.lastLoadedAt = state.cursor;
     updateSystemStatus();
     
     if (state.currentRoute === "audit") {
-      const res = await api("/api/audit-events");
-      state.auditEvents = res.auditEvents;
+      await ensureAuditEventsLoaded(true);
     }
     
     ensureSelectedRun();
@@ -691,6 +714,10 @@ function renderAuditDetailsDrawer() {
 
 function renderAuditPage() {
   const rows = filteredAudits();
+  const verification = state.auditVerification;
+  const verificationBanner = verification
+    ? '<section class="feedback-stack"><div class="feedback ' + (verification.valid ? 'success' : 'error') + '">' + (verification.valid ? '✓ ' : '⚠ ') + escapeHtml(verification.valid ? 'All audit hash chains verified.' : verification.failedChainCount + ' audit hash chain(s) failed verification.') + ' <small>Checked ' + escapeHtml(formatClock(verification.checkedAt)) + ' · ' + escapeHtml(verification.eventCount) + ' events</small></div></section>'
+    : '';
   el.app.className = "dashboard audit-page";
 
   const allEvents = state.auditEvents || [];
@@ -709,6 +736,7 @@ function renderAuditPage() {
       </div>
     </section>
     ${renderFeedback()}
+    ${verificationBanner}
     <section class="run-filters">
       <input class="run-search-input" data-audit-search type="search" placeholder="Search actor, resource ID, or summary..." value="${escapeHtml(state.auditFilters.search)}" />
       <label>Actor
@@ -965,6 +993,29 @@ function renderSettingsPage() {
 }
 
 function renderAnalyticsPage() {
+  const analytics = dashboard().analytics || { spendBuckets: [], efficiency: [] };
+  const spendBuckets = analytics.spendBuckets || [];
+  const efficiency = analytics.efficiency || [];
+  const hasSpend = spendBuckets.some((bucket) => bucket.count > 0);
+  const spendBars = hasSpend
+    ? spendBuckets
+        .map((bucket) => '<div style="background: var(--' + escapeHtml(bucket.tone) + '); height: ' + Number(bucket.heightPercent || 0) + '%; border-radius: 4px 4px 0 0;" title="' + escapeHtml(bucket.label + ': $' + Number(bucket.totalSpend || 0).toLocaleString()) + '"></div>')
+        .join("")
+    : '<p class="empty-copy" style="grid-column: 1 / -1; align-self:center;">Not enough spend data yet.</p>';
+  const spendLabels = spendBuckets.length
+    ? spendBuckets.map((bucket) => '<span>' + escapeHtml(bucket.label) + '<br><strong>$' + escapeHtml(Number(bucket.totalSpend || 0).toLocaleString()) + '</strong></span>').join("")
+    : '<span>Not enough data yet</span>';
+  const efficiencyRows = efficiency.length
+    ? efficiency
+        .map((metric) => {
+          const value = metric.value;
+          const display = value === null || value === undefined ? "Not enough data" : value + "%";
+          const width = value === null || value === undefined ? 0 : Math.max(0, Math.min(100, Number(value)));
+          return '<div><div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;"><span>' + escapeHtml(metric.label) + '</span><strong>' + escapeHtml(display) + '</strong></div><div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;"><div style="background:var(--' + escapeHtml(metric.tone) + '); width:' + width + '%; height:100%;"></div></div></div>';
+        })
+        .join("")
+    : '<p class="empty-copy">Not enough efficiency data yet.</p>';
+
   el.app.className = "dashboard analytics-page";
   el.app.innerHTML = `
     <section class="page-header">
@@ -980,43 +1031,17 @@ function renderAnalyticsPage() {
         <h3 style="margin-top:0;">Spend vs Thresholds</h3>
         <p class="muted">Procurement requests classified by total amount.</p>
         <div style="height: 200px; display: grid; align-items: end; grid-template-columns: repeat(4, 1fr); gap: 20px; padding: 20px 0; border-bottom: 2px solid var(--line);">
-          <div style="background: var(--green); height: 80%; border-radius: 4px 4px 0 0;" title="Low risk spend"></div>
-          <div style="background: var(--blue); height: 60%; border-radius: 4px 4px 0 0;" title="Medium risk spend"></div>
-          <div style="background: var(--amber); height: 40%; border-radius: 4px 4px 0 0;" title="High risk spend"></div>
-          <div style="background: var(--red); height: 15%; border-radius: 4px 4px 0 0;" title="Blocked spend"></div>
+          ${spendBars}
         </div>
         <div style="display: grid; grid-template-columns: repeat(4, 1fr); text-align: center; font-size: 11px; margin-top: 8px;">
-          <span>&lt; $1k</span><span>$1k - $10k</span><span>&gt; $10k</span><span>Blocked</span>
+          ${spendLabels}
         </div>
       </div>
       <div class="panel span-6" style="padding: 20px;">
         <h3 style="margin-top:0;">Agent Efficiency</h3>
         <p class="muted">Triage confidence levels and response SLAs.</p>
         <div style="margin-top: 20px; display: grid; gap: 14px;">
-          <div>
-            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
-              <span>Triage Agent Confidence</span><strong>89%</strong>
-            </div>
-            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
-              <div style="background:var(--green); width:89%; height:100%;"></div>
-            </div>
-          </div>
-          <div>
-            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
-              <span>SLA Compliance Rate</span><strong>96%</strong>
-            </div>
-            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
-              <div style="background:var(--blue); width:96%; height:100%;"></div>
-            </div>
-          </div>
-          <div>
-            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
-              <span>Automatic Route Accuracy</span><strong>92%</strong>
-            </div>
-            <div style="background:#e5e7eb; height:8px; border-radius:4px; overflow:hidden;">
-              <div style="background:var(--purple); width:92%; height:100%;"></div>
-            </div>
-          </div>
+          ${efficiencyRows}
         </div>
       </div>
     </div>
@@ -1824,125 +1849,121 @@ function renderAndRestoreInput(selector, start, end) {
   }
 }
 
+function upsertById(collection, items) {
+  const target = Array.isArray(collection) ? collection : [];
+  for (const item of items || []) {
+    const idx = target.findIndex((entry) => entry.id === item.id);
+    if (idx !== -1) {
+      target[idx] = item;
+    } else {
+      target.unshift(item);
+    }
+  }
+  return target;
+}
+
+function applyObservabilityChanges(payload) {
+  const changes = payload.changes || {};
+  const dashboardModel = payload.dashboard || {};
+  let hasChanges = false;
+
+  if (changes.workflowRuns?.length) {
+    state.bootstrap.workflowRuns = upsertById(state.bootstrap.workflowRuns, changes.workflowRuns);
+    state.bootstrap.workflowRuns.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    enrichedRunsCache = null;
+    hasChanges = true;
+  }
+
+  if (changes.agentRuns?.length) {
+    state.bootstrap.dashboard.agentRuns = upsertById(state.bootstrap.dashboard.agentRuns, changes.agentRuns);
+    state.bootstrap.dashboard.agentRuns.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    hasChanges = true;
+  }
+
+  if (changes.workItems?.length) {
+    state.bootstrap.dashboard.workItems = upsertById(state.bootstrap.dashboard.workItems, changes.workItems);
+    hasChanges = true;
+  }
+
+  if (Array.isArray(changes.humanApprovals)) {
+    state.bootstrap.dashboard.humanApprovals = changes.humanApprovals;
+    hasChanges = true;
+  }
+
+  if (changes.approvalRequests?.length) {
+    state.bootstrap.approvalRequests = upsertById(state.bootstrap.approvalRequests, changes.approvalRequests);
+    hasChanges = true;
+  }
+
+  if (changes.toolActionProposals?.length) {
+    state.bootstrap.toolActionProposals = upsertById(state.bootstrap.toolActionProposals, changes.toolActionProposals);
+    hasChanges = true;
+  }
+
+  if (changes.policyChecks?.length) {
+    state.bootstrap.dashboard.policyAudit.checks = upsertById(state.bootstrap.dashboard.policyAudit.checks, changes.policyChecks);
+    state.bootstrap.dashboard.policyAudit.checks.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+    state.bootstrap.dashboard.policyAudit.checks = state.bootstrap.dashboard.policyAudit.checks.slice(0, 10);
+    hasChanges = true;
+  }
+
+  if (changes.timeline?.length) {
+    state.bootstrap.dashboard.timeline = upsertById(state.bootstrap.dashboard.timeline, changes.timeline);
+    state.bootstrap.dashboard.timeline.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+    state.bootstrap.dashboard.timeline = state.bootstrap.dashboard.timeline.slice(0, 30);
+    hasChanges = true;
+  }
+
+  if (changes.artifacts?.length) {
+    state.bootstrap.dashboard.artifacts = upsertById(state.bootstrap.dashboard.artifacts, changes.artifacts);
+    hasChanges = true;
+  }
+
+  if (changes.auditEvents?.length && (state.currentRoute === "audit" || state.auditEvents.length)) {
+    state.auditEvents = upsertById(state.auditEvents, changes.auditEvents);
+    state.auditEvents.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+    hasChanges = true;
+  }
+
+  if (dashboardModel.metrics) {
+    state.bootstrap.dashboard.metrics = dashboardModel.metrics;
+    hasChanges = true;
+  }
+
+  if (dashboardModel.analytics) {
+    state.bootstrap.dashboard.analytics = dashboardModel.analytics;
+    hasChanges = true;
+  }
+
+  if (dashboardModel.policyAudit?.summary) {
+    state.bootstrap.dashboard.policyAudit.summary = dashboardModel.policyAudit.summary;
+    hasChanges = true;
+  }
+
+  if (dashboardModel.policyAudit?.checks) {
+    state.bootstrap.dashboard.policyAudit.checks = dashboardModel.policyAudit.checks;
+    hasChanges = true;
+  }
+
+  if (payload.health) {
+    state.health = payload.health;
+  }
+
+  state.cursor = payload.cursor || state.cursor || new Date().toISOString();
+  state.lastLoadedAt = state.cursor;
+  return hasChanges;
+}
+
 async function pollUpdate() {
-  if (!state.bootstrap || !state.lastLoadedAt) {
+  if (!state.bootstrap || !state.cursor) {
     return load();
   }
-  const since = state.lastLoadedAt;
-  state.lastLoadedAt = new Date().toISOString();
+  const since = state.cursor;
   try {
-    const [runsRes, agentRunsRes, policyChecksRes, timelineRes, artifactsRes, metricsRes, workItemsRes] = await Promise.all([
-      api(`/api/workflow-runs?since=${encodeURIComponent(since)}`),
-      api(`/api/agent-runs?since=${encodeURIComponent(since)}`),
-      api(`/api/policy-checks?since=${encodeURIComponent(since)}`),
-      api(`/api/timeline?since=${encodeURIComponent(since)}`),
-      api(`/api/artifacts?since=${encodeURIComponent(since)}`),
-      api(`/api/metrics`),
-      api(`/api/work-items?since=${encodeURIComponent(since)}`)
-    ]);
-
+    const payload = await api(`/api/observability/changes?since=${encodeURIComponent(since)}`);
     state.pollErrorCount = 0;
+    const hasChanges = applyObservabilityChanges(payload);
     updateSystemStatus();
-
-    let hasChanges = false;
-
-    // 1. Merge workflowRuns
-    if (runsRes.workflowRuns?.length) {
-      hasChanges = true;
-      runsRes.workflowRuns.forEach(run => {
-        const idx = state.bootstrap.workflowRuns.findIndex(r => r.id === run.id);
-        if (idx !== -1) {
-          state.bootstrap.workflowRuns[idx] = run;
-        } else {
-          state.bootstrap.workflowRuns.unshift(run);
-        }
-      });
-      // Invalidate runs cache
-      enrichedRunsCache = null;
-    }
-
-    // 2. Merge dashboard.agentRuns
-    if (agentRunsRes.agentRuns?.length) {
-      hasChanges = true;
-      agentRunsRes.agentRuns.forEach(run => {
-        const idx = state.bootstrap.dashboard.agentRuns.findIndex(r => r.id === run.id);
-        if (idx !== -1) {
-          state.bootstrap.dashboard.agentRuns[idx] = run;
-        } else {
-          state.bootstrap.dashboard.agentRuns.unshift(run);
-        }
-      });
-    }
-
-    // 3. Merge policy checks
-    if (policyChecksRes.policyChecks?.length) {
-      hasChanges = true;
-      policyChecksRes.policyChecks.forEach(check => {
-        const idx = state.bootstrap.dashboard.policyAudit.checks.findIndex(c => c.id === check.id);
-        if (idx !== -1) {
-          state.bootstrap.dashboard.policyAudit.checks[idx] = check;
-        } else {
-          state.bootstrap.dashboard.policyAudit.checks.unshift(check);
-        }
-      });
-      state.bootstrap.dashboard.policyAudit.checks.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
-      const allowed = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "allowed").length;
-      const blocked = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "blocked").length;
-      const alerts = state.bootstrap.dashboard.policyAudit.checks.filter(c => c.result === "alert").length;
-      state.bootstrap.dashboard.policyAudit.summary = {
-        allChecks: state.bootstrap.dashboard.policyAudit.checks.length,
-        allowed,
-        blocked,
-        alerts
-      };
-    }
-
-    // 4. Merge timeline
-    if (timelineRes.timeline?.length) {
-      hasChanges = true;
-      timelineRes.timeline.forEach(event => {
-        const idx = state.bootstrap.dashboard.timeline.findIndex(e => e.id === event.id);
-        if (idx !== -1) {
-          state.bootstrap.dashboard.timeline[idx] = event;
-        } else {
-          state.bootstrap.dashboard.timeline.unshift(event);
-        }
-      });
-      state.bootstrap.dashboard.timeline.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
-      state.bootstrap.dashboard.timeline = state.bootstrap.dashboard.timeline.slice(0, 30);
-    }
-
-    // 5. Merge artifacts
-    if (artifactsRes.artifacts?.length) {
-      hasChanges = true;
-      artifactsRes.artifacts.forEach(artifact => {
-        const idx = state.bootstrap.dashboard.artifacts.findIndex(a => a.id === artifact.id);
-        if (idx !== -1) {
-          state.bootstrap.dashboard.artifacts[idx] = artifact;
-        } else {
-          state.bootstrap.dashboard.artifacts.unshift(artifact);
-        }
-      });
-    }
-
-    // 6. Merge workItems
-    if (workItemsRes.workItems?.length) {
-      hasChanges = true;
-      workItemsRes.workItems.forEach(item => {
-        const idx = state.bootstrap.dashboard.workItems.findIndex(w => w.id === item.id);
-        if (idx !== -1) {
-          state.bootstrap.dashboard.workItems[idx] = item;
-        } else {
-          state.bootstrap.dashboard.workItems.unshift(item);
-        }
-      });
-    }
-
-    // 7. Update metrics
-    if (metricsRes.metrics) {
-      state.bootstrap.dashboard.metrics = metricsRes.metrics;
-      hasChanges = true;
-    }
 
     if (hasChanges) {
       ensureSelectedRun();
@@ -1972,11 +1993,20 @@ function configurePolling() {
 
 el.actorSelect.addEventListener("change", async (event) => {
   state.actorId = event.target.value;
+  state.auditEvents = [];
+  state.auditVerification = null;
   await load();
 });
 
-window.addEventListener("hashchange", () => {
+window.addEventListener("hashchange", async () => {
   state.currentRoute = routeFromHash();
+  if (state.currentRoute === "audit") {
+    try {
+      await ensureAuditEventsLoaded();
+    } catch (error) {
+      state.errorMessage = error.message || "Failed to load audit events";
+    }
+  }
   render();
 });
 
@@ -2111,8 +2141,8 @@ el.app.addEventListener("click", async (event) => {
     state.selectedAuditEventId = null;
     render();
   } else if (action === "verify-hash-chains") {
-    await runUiAction("verify-hash-chains", "All cryptographic audit hash chains verified successfully.", async () => {
-      await new Promise(resolve => setTimeout(resolve, 800));
+    await runUiAction("verify-hash-chains", "Audit hash chain verification completed.", async () => {
+      state.auditVerification = await api("/api/audit-events/verify");
     });
   }
 });

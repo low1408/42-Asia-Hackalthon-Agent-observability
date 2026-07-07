@@ -64,7 +64,7 @@ async function runAppJs(sandbox) {
   code = code.replace("const el =", "window.el =");
   
   // Bind standard variables and functions
-  sandbox.console = sandbox.console || console;
+  sandbox.console = sandbox.console || { log: console.log, warn: console.warn, error: () => {} };
   sandbox.setInterval = sandbox.setInterval || (() => {});
   sandbox.setTimeout = sandbox.setTimeout || (() => {});
   sandbox.Promise = sandbox.Promise || Promise;
@@ -289,6 +289,96 @@ test("Direct RBAC Injection - Validate backend auth boundaries on execute endpoi
     assert.equal(res.status, 403, "Low-privilege user execution should return 403 Forbidden");
     const json = await res.json();
     assert.match(json.error, /not allowed to execute_tool_action/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("Authentication hardening requires explicit user identity but leaves health public", async () => {
+  const { services } = createHarness();
+  const server = createServer({ services });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+
+  try {
+    const bootstrapRes = await fetch(`http://localhost:${port}/api/bootstrap`);
+    assert.equal(bootstrapRes.status, 401, "Missing x-user-id should not default to admin");
+
+    const healthRes = await fetch(`http://localhost:${port}/api/health`);
+    assert.equal(healthRes.status, 200, "Health endpoint should be public for infrastructure checks");
+    const health = await healthRes.json();
+    assert.equal(health.status, "healthy");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("Audit verification endpoint detects tampered audit events and health degradation", async () => {
+  const { services, requester } = createHarness();
+  createRun(services, requester);
+  const server = createServer({ services });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+
+  try {
+    let verifyRes = await fetch(`http://localhost:${port}/api/audit-events/verify`, {
+      headers: { "x-user-id": "usr_admin" }
+    });
+    assert.equal(verifyRes.status, 200);
+    let verification = await verifyRes.json();
+    assert.equal(verification.valid, true);
+
+    services.store.auditEvents[0].summary = "tampered after hashing";
+
+    verifyRes = await fetch(`http://localhost:${port}/api/audit-events/verify`, {
+      headers: { "x-user-id": "usr_admin" }
+    });
+    verification = await verifyRes.json();
+    assert.equal(verification.valid, false);
+    assert.equal(verification.failedChainCount, 1);
+
+    const healthRes = await fetch(`http://localhost:${port}/api/health`);
+    const health = await healthRes.json();
+    assert.equal(health.status, "degraded");
+    assert.equal(health.audit.valid, false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("Observability snapshot and changes use server-issued cursors", async () => {
+  const { services, requester } = createHarness();
+  const server = createServer({ services });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+
+  try {
+    const snapshotRes = await fetch(`http://localhost:${port}/api/observability/snapshot`, {
+      headers: { "x-user-id": "usr_admin" }
+    });
+    assert.equal(snapshotRes.status, 200);
+    const snapshot = await snapshotRes.json();
+    assert.ok(snapshot.cursor, "Snapshot should return a cursor");
+
+    const run = createRun(services, requester, { vendor: "CursorCo", amount: 2500 });
+
+    const changesRes = await fetch(`http://localhost:${port}/api/observability/changes?since=${encodeURIComponent(snapshot.cursor)}`, {
+      headers: { "x-user-id": "usr_admin" }
+    });
+    assert.equal(changesRes.status, 200);
+    const changes = await changesRes.json();
+    assert.ok(changes.cursor, "Changes response should return the next cursor");
+    assert.equal(changes.changes.workflowRuns.some((entry) => entry.id === run.id), true);
+    assert.ok(Array.isArray(changes.dashboard.metrics));
+    assert.ok(changes.dashboard.analytics);
+
+    const missingCursorRes = await fetch(`http://localhost:${port}/api/observability/changes`, {
+      headers: { "x-user-id": "usr_admin" }
+    });
+    assert.equal(missingCursorRes.status, 400);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

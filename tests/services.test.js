@@ -244,3 +244,36 @@ test("delegation map and artifact rows are generated from workflow relationships
   );
   assert.equal(services.listArtifacts().some((artifact) => artifact.workflowRunId === run.id && artifact.type === "Tool Execution Result"), true);
 });
+
+test("audit sequence cache rehydrates from existing events and verifies all chains", () => {
+  const { store, services, requester, admin } = createHarness();
+  const run = createRun(services, requester, { amount: 900, vendorRisk: "low" });
+  const eventsBeforeRestart = store.auditEvents.filter((event) => event.workflowRunId === run.id);
+  const lastBeforeRestart = eventsBeforeRestart.at(-1);
+
+  const restartedServices = createAppServices(store);
+  const appended = restartedServices.appendAuditEvent({
+    workspaceId: run.workspaceId,
+    workflowRunId: run.id,
+    actorType: "system",
+    actorId: "test",
+    source: "test",
+    action: "test.event",
+    targetType: "WorkflowRun",
+    targetId: run.id,
+    summary: "Sequence cache append after restart"
+  });
+
+  assert.equal(appended.sequence, lastBeforeRestart.sequence + 1);
+  assert.equal(appended.previousHash, lastBeforeRestart.hash);
+  assert.equal(restartedServices.validateAuditHashChain(run.id), true);
+
+  restartedServices.updatePolicyRule({
+    actor: admin,
+    ruleId: "pol_amount_finance",
+    patch: { enabled: false }
+  });
+  const allChains = restartedServices.validateAllAuditHashChains();
+  assert.equal(allChains.valid, true);
+  assert.equal(allChains.chains.some((chain) => chain.workflowRunId === null), true);
+});

@@ -75,6 +75,9 @@ export function hasAnyRole(actor, allowedRoles) {
 }
 
 export function assertUserCan(actor, action) {
+  if (!actor) {
+    throw httpError(401, "Authentication required");
+  }
   const grants = {
     create_workflow_run: [ROLES.REQUESTER, ROLES.OPERATOR, ROLES.ADMIN],
     approve: [ROLES.APPROVER, ROLES.ADMIN],

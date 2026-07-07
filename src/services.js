@@ -64,6 +64,29 @@ function titleCase(value) {
 
 export function createAppServices(store) {
   const simulationTimers = new Map();
+  const auditSequenceCache = new Map();
+
+  function auditChainKey(workspaceId, workflowRunId) {
+    return `${workspaceId}::${workflowRunId ?? "__workspace__"}`;
+  }
+
+  function rehydrateAuditSequenceCache() {
+    auditSequenceCache.clear();
+    for (const event of store.auditEvents) {
+      const key = auditChainKey(event.workspaceId, event.workflowRunId);
+      const current = auditSequenceCache.get(key);
+      if (!current || Number(event.sequence) >= Number(current.sequence)) {
+        auditSequenceCache.set(key, {
+          workspaceId: event.workspaceId,
+          workflowRunId: event.workflowRunId ?? null,
+          sequence: Number(event.sequence) || 0,
+          hash: event.hash ?? null
+        });
+      }
+    }
+  }
+
+  rehydrateAuditSequenceCache();
 
   function persistInBackground() {
     const result = store.persist?.();
@@ -74,13 +97,23 @@ export function createAppServices(store) {
     }
   }
 
-  function actorFromUserId(userId = "usr_admin") {
-    return findById(store.users, userId, "User");
+  function actorFromUserId(userId) {
+    if (!userId) {
+      throw httpError(401, "Missing x-user-id header");
+    }
+    const user = store.users.find((entry) => entry.id === userId);
+    if (!user) {
+      throw httpError(401, `Unknown user identity: ${userId}`);
+    }
+    return user;
   }
 
   function agentFromId(agentId, token) {
     const agent = findById(store.agents, agentId, "Agent");
-    if (token && agent.authToken !== token) {
+    if (!token) {
+      throw httpError(401, "Missing x-agent-token header");
+    }
+    if (agent.authToken !== token) {
       throw httpError(403, "Invalid agent token");
     }
     return agent;
@@ -101,9 +134,8 @@ export function createAppServices(store) {
     evidenceArtifactIds = [],
     summary
   }) {
-    const previous = [...store.auditEvents]
-      .reverse()
-      .find((event) => event.workspaceId === workspaceId && event.workflowRunId === workflowRunId);
+    const chainKey = auditChainKey(workspaceId, workflowRunId);
+    const previous = auditSequenceCache.get(chainKey);
     const event = {
       id: createId("aud"),
       workspaceId,
@@ -125,6 +157,12 @@ export function createAppServices(store) {
     };
     event.hash = sha256(stableJson({ ...event, hash: undefined }));
     store.auditEvents.push(event);
+    auditSequenceCache.set(chainKey, {
+      workspaceId,
+      workflowRunId: workflowRunId ?? null,
+      sequence: event.sequence,
+      hash: event.hash
+    });
     return event;
   }
 
@@ -1010,6 +1048,133 @@ export function createAppServices(store) {
     };
   }
 
+  function maxIso(...values) {
+    const valid = values.filter(Boolean).map((value) => new Date(value).getTime()).filter((value) => !Number.isNaN(value));
+    if (!valid.length) return null;
+    return new Date(Math.max(...valid)).toISOString();
+  }
+
+  function readModelCursor() {
+    const timestamps = [
+      ...store.workflowRuns.flatMap((run) => [run.createdAt, run.updatedAt]),
+      ...store.tasks.flatMap((task) => [task.createdAt, task.updatedAt]),
+      ...store.approvalRequests.flatMap((approval) => [approval.createdAt, approval.updatedAt, ...(approval.decisions ?? []).map((decision) => decision.decidedAt)]),
+      ...store.toolActionProposals.flatMap((proposal) => [proposal.createdAt, proposal.updatedAt]),
+      ...store.agentRuns.flatMap((run) => [run.startedAt, run.updatedAt, run.completedAt]),
+      ...store.policyChecks.map((check) => check.occurredAt),
+      ...store.auditEvents.map((event) => event.occurredAt),
+      ...store.evidenceArtifacts.flatMap((artifact) => [artifact.createdAt, artifact.updatedAt]),
+      ...store.purchaseRequests.map((request) => request.createdAt),
+      ...store.tickets.map((ticket) => ticket.createdAt)
+    ];
+    return maxIso(...timestamps) ?? nowIso();
+  }
+
+  function hasChangedSince(item, since, fields) {
+    if (!since) return true;
+    return fields.some((field) => {
+      const value = item[field];
+      return value && value >= since;
+    });
+  }
+
+  function listAuditEvents(since) {
+    let events = store.auditEvents;
+    if (since) {
+      events = events.filter((event) => event.occurredAt >= since);
+    }
+    return [...events].sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+  }
+
+  function listApprovalRequests(since) {
+    let approvals = store.approvalRequests;
+    if (since) {
+      approvals = approvals.filter((approval) => {
+        if (hasChangedSince(approval, since, ["createdAt", "updatedAt"])) return true;
+        return (approval.decisions ?? []).some((decision) => decision.decidedAt >= since);
+      });
+    }
+    return [...approvals].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  function listToolActionProposals(since) {
+    let proposals = store.toolActionProposals;
+    if (since) {
+      proposals = proposals.filter((proposal) => hasChangedSince(proposal, since, ["createdAt", "updatedAt"]));
+    }
+    return [...proposals].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  function pct(value, total) {
+    if (!total) return null;
+    return Math.round((value / total) * 100);
+  }
+
+  function analytics() {
+    const buckets = [
+      { key: "under_1k", label: "< $1k", tone: "green", count: 0, totalSpend: 0 },
+      { key: "between_1k_10k", label: "$1k - $10k", tone: "blue", count: 0, totalSpend: 0 },
+      { key: "over_10k", label: "> $10k", tone: "amber", count: 0, totalSpend: 0 },
+      { key: "blocked", label: "Blocked", tone: "red", count: 0, totalSpend: 0 }
+    ];
+
+    for (const run of store.workflowRuns) {
+      const amount = Number(run.request?.amount ?? 0);
+      const bucket =
+        run.status === WORKFLOW_STATUS.BLOCKED || run.request?.vendorRisk === "sanctioned"
+          ? buckets[3]
+          : amount < 1000
+            ? buckets[0]
+            : amount <= 10000
+              ? buckets[1]
+              : buckets[2];
+      bucket.count += 1;
+      bucket.totalSpend += amount;
+    }
+
+    const maxSpend = Math.max(0, ...buckets.map((bucket) => bucket.totalSpend));
+    for (const bucket of buckets) {
+      bucket.heightPercent = maxSpend ? Math.max(8, Math.round((bucket.totalSpend / maxSpend) * 100)) : 0;
+    }
+
+    const proposals = store.toolActionProposals.filter((proposal) => Number.isFinite(Number(proposal.confidence)));
+    const averageConfidence = proposals.length
+      ? Math.round((proposals.reduce((sum, proposal) => sum + Number(proposal.confidence), 0) / proposals.length) * 100)
+      : null;
+
+    const now = Date.now();
+    const decidedApprovals = store.approvalRequests.filter((approval) => approval.status !== APPROVAL_STATUS.PENDING && approval.decisions?.length);
+    const pendingBreaches = store.approvalRequests.filter((approval) => approval.status === APPROVAL_STATUS.PENDING && approval.dueAt && new Date(approval.dueAt).getTime() < now);
+    const onTimeDecisions = decidedApprovals.filter((approval) => {
+      const finalDecisionAt = approval.decisions.reduce((latest, decision) => {
+        const decidedAt = new Date(decision.decidedAt).getTime();
+        return Number.isNaN(decidedAt) ? latest : Math.max(latest, decidedAt);
+      }, 0);
+      return finalDecisionAt && approval.dueAt && finalDecisionAt <= new Date(approval.dueAt).getTime();
+    });
+    const slaPopulation = decidedApprovals.length + pendingBreaches.length;
+    const slaComplianceRate = slaPopulation ? pct(onTimeDecisions.length, slaPopulation) : null;
+
+    const resolvedProposals = store.toolActionProposals.filter((proposal) => [TOOL_ACTION_STATUS.APPROVED, TOOL_ACTION_STATUS.EXECUTED].includes(proposal.status));
+    const nonBlockedProposals = store.toolActionProposals.filter((proposal) => proposal.status !== TOOL_ACTION_STATUS.BLOCKED);
+    const automaticRouteAccuracy = nonBlockedProposals.length ? pct(resolvedProposals.length, nonBlockedProposals.length) : null;
+
+    return {
+      spendBuckets: buckets,
+      efficiency: [
+        { key: "triage_confidence", label: "Triage Agent Confidence", value: averageConfidence, tone: "green" },
+        { key: "sla_compliance", label: "SLA Compliance Rate", value: slaComplianceRate, tone: "blue" },
+        { key: "route_accuracy", label: "Automatic Route Accuracy", value: automaticRouteAccuracy, tone: "purple" }
+      ],
+      counts: {
+        workflowRuns: store.workflowRuns.length,
+        proposals: store.toolActionProposals.length,
+        approvals: store.approvalRequests.length,
+        pendingSlaBreaches: pendingBreaches.length
+      }
+    };
+  }
+
   function dashboardMetrics() {
     return [
       { label: "Active Work Items", value: store.workflowRuns.filter((run) => run.status !== WORKFLOW_STATUS.COMPLETED).length, delta: "Live", tone: "blue", icon: "▣" },
@@ -1027,6 +1192,7 @@ export function createAppServices(store) {
       agentRuns: listAgentRuns(),
       humanApprovals: listApprovalDashboard(),
       timeline: listTimeline(),
+      analytics: analytics(),
       policyAudit: {
         summary: policyAuditSummary(),
         checks: listPolicyChecks().slice(0, 10)
@@ -1089,15 +1255,166 @@ export function createAppServices(store) {
     };
   }
 
-  function validateAuditHashChain(workflowRunId) {
-    const events = store.auditEvents.filter((event) => event.workflowRunId === workflowRunId).sort((a, b) => a.sequence - b.sequence);
+  function verifyAuditChainEvents({ workspaceId, workflowRunId, events }) {
+    const ordered = [...events].sort((a, b) => a.sequence - b.sequence || a.occurredAt.localeCompare(b.occurredAt));
+    const failures = [];
     let previousHash = null;
-    for (const event of events) {
-      const expected = sha256(stableJson({ ...event, hash: undefined }));
-      if (event.previousHash !== previousHash || event.hash !== expected) return false;
+    let expectedSequence = 1;
+
+    for (const event of ordered) {
+      const expectedHash = sha256(stableJson({ ...event, hash: undefined }));
+      if (event.sequence !== expectedSequence) {
+        failures.push({
+          eventId: event.id,
+          sequence: event.sequence,
+          expectedSequence,
+          reason: "sequence_gap_or_duplicate"
+        });
+      }
+      if (event.previousHash !== previousHash) {
+        failures.push({
+          eventId: event.id,
+          sequence: event.sequence,
+          reason: "previous_hash_mismatch",
+          expectedPreviousHash: previousHash,
+          actualPreviousHash: event.previousHash
+        });
+      }
+      if (event.hash !== expectedHash) {
+        failures.push({
+          eventId: event.id,
+          sequence: event.sequence,
+          reason: "event_hash_mismatch",
+          expectedHash,
+          actualHash: event.hash
+        });
+      }
       previousHash = event.hash;
+      expectedSequence += 1;
     }
-    return true;
+
+    return {
+      workspaceId,
+      workflowRunId: workflowRunId ?? null,
+      valid: failures.length === 0,
+      eventCount: ordered.length,
+      lastSequence: ordered.at(-1)?.sequence ?? 0,
+      lastHash: ordered.at(-1)?.hash ?? null,
+      failures
+    };
+  }
+
+  function validateAuditHashChain(workflowRunId) {
+    const events = store.auditEvents.filter((event) => event.workflowRunId === workflowRunId);
+    const first = events[0];
+    if (!first) return true;
+    return verifyAuditChainEvents({ workspaceId: first.workspaceId, workflowRunId, events }).valid;
+  }
+
+  function validateAllAuditHashChains() {
+    const grouped = new Map();
+    for (const event of store.auditEvents) {
+      const key = auditChainKey(event.workspaceId, event.workflowRunId);
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          workspaceId: event.workspaceId,
+          workflowRunId: event.workflowRunId ?? null,
+          events: []
+        });
+      }
+      grouped.get(key).events.push(event);
+    }
+
+    const chains = [...grouped.values()]
+      .map((group) => verifyAuditChainEvents(group))
+      .sort((a, b) => String(a.workflowRunId ?? "").localeCompare(String(b.workflowRunId ?? "")));
+    const failedChains = chains.filter((chain) => !chain.valid);
+    return {
+      checkedAt: nowIso(),
+      valid: failedChains.length === 0,
+      chainCount: chains.length,
+      eventCount: store.auditEvents.length,
+      failedChainCount: failedChains.length,
+      chains
+    };
+  }
+
+  function healthCheck() {
+    const audit = validateAllAuditHashChains();
+    const arrayCollections = [
+      "workspaces",
+      "users",
+      "agents",
+      "workflowRuns",
+      "tasks",
+      "approvalRequests",
+      "toolActionProposals",
+      "agentRuns",
+      "policyChecks",
+      "auditEvents",
+      "evidenceArtifacts"
+    ];
+    const missingCollections = arrayCollections.filter((key) => !Array.isArray(store[key]));
+    const healthy = missingCollections.length === 0 && audit.valid;
+    return {
+      status: healthy ? "healthy" : "degraded",
+      checkedAt: nowIso(),
+      storage: {
+        type: store.storage?.type ?? "memory",
+        ok: missingCollections.length === 0,
+        missingCollections
+      },
+      audit: {
+        status: audit.valid ? "healthy" : "degraded",
+        valid: audit.valid,
+        chainCount: audit.chainCount,
+        eventCount: audit.eventCount,
+        failedChainCount: audit.failedChainCount
+      },
+      simulator: {
+        status: "healthy",
+        activeTimers: simulationTimers.size
+      }
+    };
+  }
+
+  function observabilitySnapshot() {
+    return {
+      ...bootstrap(),
+      cursor: readModelCursor(),
+      health: healthCheck()
+    };
+  }
+
+  function observabilityChanges(since) {
+    if (!since) {
+      throw httpError(400, "changes endpoint requires a since cursor");
+    }
+    const policyChecks = listPolicyChecks(since);
+    return {
+      cursor: readModelCursor(),
+      changes: {
+        workflowRuns: listWorkflowRuns(since),
+        agentRuns: listAgentRuns({ since }),
+        workItems: listWorkItems({ since }),
+        approvalRequests: listApprovalRequests(since),
+        humanApprovals: listApprovalDashboard(),
+        toolActionProposals: listToolActionProposals(since),
+        policyChecks,
+        timeline: listTimeline(since),
+        auditEvents: listAuditEvents(since),
+        artifacts: listArtifacts(since)
+      },
+      dashboard: {
+        metrics: dashboardMetrics(),
+        analytics: analytics(),
+        policyAudit: {
+          summary: policyAuditSummary(),
+          checks: policyChecks.length ? listPolicyChecks().slice(0, 10) : undefined
+        }
+      },
+      health: healthCheck()
+    };
   }
 
   function updatePolicyRule({ actor, ruleId, patch }) {
@@ -1207,10 +1524,16 @@ export function createAppServices(store) {
     auditTrail,
     auditExport,
     validateAuditHashChain,
+    validateAllAuditHashChains,
+    healthCheck,
+    observabilitySnapshot,
+    observabilityChanges,
     evaluatePolicy,
     updatePolicyRule,
     receiveWebhookEvent,
     bootstrap,
-    dashboardMetrics
+    dashboardMetrics,
+    analytics,
+    readModelCursor
   };
 }
